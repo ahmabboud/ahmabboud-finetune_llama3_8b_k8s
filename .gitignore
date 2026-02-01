@@ -3,3 +3,4 @@
 *.pem
 upstream/.DS_Store
 upstream/*
+infra/k8s-installation/environment.sh
