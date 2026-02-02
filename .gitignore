@@ -1,8 +1,13 @@
 .venv/
 .env
 *.pem
-upstream/.DS_Store
+.DS_Store
 upstream/*
 infra/k8s-installation/environment.sh
 temp/
 checkpoints/
+__pycache__/
+*.pyc
+*.tfplan
+tfplan
+.DS_Store
