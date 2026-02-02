@@ -1,0 +1,454 @@
+---
+# ConfigMap for training configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: training-config
+  namespace: default
+data:
+  train_config.yaml: |
+    model:
+      name: "meta-llama/Meta-Llama-3-8B-Instruct"
+      use_lora: true
+      use_flash_attention: true
+      torch_dtype: "bfloat16"
+    
+    lora:
+      r: 64
+      lora_alpha: 128
+      lora_dropout: 0.05
+      target_modules:
+        - "q_proj"
+        - "k_proj"
+        - "v_proj"
+        - "o_proj"
+        - "gate_proj"
+        - "up_proj"
+        - "down_proj"
+    
+    data:
+      train_path: "/mnt/data/datasets/train.jsonl"
+      val_path: "/mnt/data/datasets/val.jsonl"
+      max_length: 2048
+    
+    training:
+      output_dir: "/mnt/data/checkpoints/llama3-function-calling"
+      num_train_epochs: 3
+      per_device_train_batch_size: 16
+      per_device_eval_batch_size: 16
+      gradient_accumulation_steps: 2
+      learning_rate: 1.5e-4
+      lr_scheduler_type: "cosine"
+      warmup_ratio: 0.03
+      weight_decay: 0.01
+      save_steps: 200
+      eval_steps: 200
+      logging_steps: 10
+      save_total_limit: 3
+      gradient_checkpointing: true
+      dataloader_num_workers: 4
+      dataloader_pin_memory: true
+    
+    loss:
+      completion_only: true
+    
+    # DeepSpeed ZeRO-2 configuration (better LoRA compatibility)
+    deepspeed:
+      enabled: true
+      zero_stage: 2
+      offload_optimizer: false
+      offload_param: false
+      zero3_init_flag: false
+      zero3_save_16bit_model: false
+    
+    wandb:
+      enabled: true
+      project: "llama3-function-calling"
+      run_name: "h100-16x-lora"
+---
+# Headless service for StatefulSet DNS
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama3-training
+  namespace: default
+spec:
+  clusterIP: None
+  selector:
+    app: llama3-training
+  ports:
+    - name: nccl
+      port: 29500
+      targetPort: 29500
+  publishNotReadyAddresses: true
+---
+# StatefulSet for stable network identity
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: llama3-training
+  namespace: default
+spec:
+  serviceName: llama3-training
+  replicas: 2  # Number of nodes (2 GPU nodes x 8 GPUs each = 16 GPUs)
+  podManagementPolicy: Parallel  # Start all pods at once
+  selector:
+    matchLabels:
+      app: llama3-training
+  template:
+    metadata:
+      labels:
+        app: llama3-training
+    spec:
+      # Schedule on GPU nodes
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+      
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+      
+      # Ensure pods land on different nodes
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: llama3-training
+              topologyKey: kubernetes.io/hostname
+      
+      containers:
+        - name: trainer
+          image: nvcr.io/nvidia/pytorch:24.07-py3
+          imagePullPolicy: IfNotPresent
+          
+          env:
+            - name: NCCL_DEBUG
+              value: "INFO"
+            - name: NCCL_IB_DISABLE
+              value: "0"
+            - name: NCCL_NET_GDR_LEVEL
+              value: "5"
+            # Master address is stateful set pod-0
+            - name: MASTER_ADDR
+              value: "llama3-training-0.llama3-training.default.svc.cluster.local"
+            - name: MASTER_PORT
+              value: "29500"
+            - name: WORLD_SIZE
+              value: "16"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+            - name: WANDB_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: wandb-token
+                  key: key
+          
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              
+              # Install dependencies (DeepSpeed ZeRO-3 + TRL SFTTrainer - official approach)
+              pip install -q transformers datasets accelerate peft wandb bitsandbytes trl deepspeed
+              pip install -q flash-attn --no-build-isolation
+              
+              # Set up working directory
+              cd /mnt/data/app
+              
+              # Create training module
+              mkdir -p src/training configs
+              
+              # Create Accelerate config for DeepSpeed ZeRO-2 (better compatibility with LoRA)
+              cat > configs/accelerate_config.yaml << 'ACCEL_EOF'
+              compute_environment: LOCAL_MACHINE
+              debug: false
+              deepspeed_config:
+                deepspeed_multinode_launcher: standard
+                gradient_accumulation_steps: 8
+                offload_optimizer_device: none
+                offload_param_device: none
+                zero3_init_flag: false
+                zero3_save_16bit_model: false
+                zero_stage: 2
+              distributed_type: DEEPSPEED
+              downcast_bf16: 'no'
+              machine_rank: ${NODE_RANK}
+              main_training_function: main
+              mixed_precision: bf16
+              num_machines: 2
+              num_processes: 16
+              rdzv_backend: static
+              same_network: true
+              tpu_env: []
+              tpu_use_cluster: false
+              tpu_use_sudo: false
+              use_cpu: false
+              ACCEL_EOF
+              
+              # Create train.py using TRL's SFTTrainer (official PEFT+DeepSpeed approach)
+              cat > src/training/train.py << 'TRAIN_EOF'
+              #!/usr/bin/env python3
+              """
+              Official PEFT + DeepSpeed ZeRO-3 training using TRL SFTTrainer.
+              Based on: https://huggingface.co/docs/peft/accelerate/deepspeed
+              """
+              import os
+              import sys
+              from pathlib import Path
+              import torch
+              import yaml
+              import wandb
+              from datasets import load_dataset, Dataset
+              from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+              from peft import LoraConfig, TaskType
+              from trl import SFTTrainer, SFTConfig
+              
+              def main():
+                  config_path = os.environ.get("CONFIG_PATH", "/mnt/data/app/configs/train_config.yaml")
+                  
+                  with open(config_path) as f:
+                      config = yaml.safe_load(f)
+                  
+                  # Get distributed rank info
+                  local_rank = int(os.environ.get("LOCAL_RANK", 0))
+                  world_rank = int(os.environ.get("RANK", 0))
+                  
+                  print(f"[Rank {world_rank}] Starting training with DeepSpeed ZeRO-3 + LoRA")
+                  
+                  # Initialize wandb only on rank 0
+                  if world_rank == 0 and config.get("wandb", {}).get("enabled") and os.getenv("WANDB_API_KEY"):
+                      wandb.init(
+                          project=config["wandb"].get("project", "llama3-training"),
+                          name=config["wandb"].get("run_name", "training-run"),
+                          config=config
+                      )
+                  
+                  # Model and tokenizer
+                  model_name = config["model"]["name"]
+                  local_model = "/mnt/data/models/llama3-8b-instruct"
+                  model_path = local_model if Path(local_model).exists() else model_name
+                  
+                  print(f"[Rank {world_rank}] Loading model from {model_path}")
+                  
+                  tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                  if tokenizer.pad_token is None:
+                      tokenizer.pad_token = tokenizer.eos_token
+                  tokenizer.padding_side = "right"
+                  
+                  # Model kwargs
+                  model_kwargs = {
+                      "torch_dtype": torch.bfloat16,
+                      "trust_remote_code": True,
+                      "attn_implementation": "flash_attention_2" if config["model"].get("use_flash_attention", True) else "eager",
+                      "use_cache": False,
+                  }
+                  
+                  model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
+                  
+                  # LoRA config
+                  lora_cfg = config.get("lora", {})
+                  peft_config = LoraConfig(
+                      r=lora_cfg.get("r", 64),
+                      lora_alpha=lora_cfg.get("lora_alpha", 128),
+                      lora_dropout=lora_cfg.get("lora_dropout", 0.05),
+                      target_modules=lora_cfg.get("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]),
+                      task_type=TaskType.CAUSAL_LM,
+                      bias="none",
+                  )
+                  
+                  # Load datasets
+                  train_path = config["data"]["train_path"]
+                  val_path = config["data"].get("val_path")
+                  max_length = config["data"].get("max_length", 2048)
+                  
+                  # Cache tokenized data
+                  cache_dir = "/mnt/data/cache/tokenized"
+                  os.makedirs(cache_dir, exist_ok=True)
+                  train_cache = f"{cache_dir}/train_sft"
+                  val_cache = f"{cache_dir}/val_sft"
+                  
+                  import time
+                  import fcntl
+                  lock_file = f"{cache_dir}/.tokenize.lock"
+                  
+                  def format_chat(example):
+                      """Format messages using chat template for SFTTrainer"""
+                      text = tokenizer.apply_chat_template(
+                          example["messages"],
+                          tokenize=False,
+                          add_generation_prompt=False
+                      )
+                      return {"text": text}
+                  
+                  if world_rank == 0:
+                      with open(lock_file, 'w') as f:
+                          fcntl.flock(f, fcntl.LOCK_EX)
+                          
+                          if not os.path.exists(f"{train_cache}/dataset_info.json"):
+                              print(f"[Rank {world_rank}] Processing training data...")
+                              train_data = load_dataset('json', data_files=train_path, split='train')
+                              train_data = train_data.map(format_chat, remove_columns=["messages", "id"])
+                              train_data.save_to_disk(train_cache)
+                              print(f"[Rank {world_rank}] Saved {len(train_data)} training examples")
+                              
+                              if val_path and Path(val_path).exists():
+                                  val_data = load_dataset('json', data_files=val_path, split='train')
+                                  val_data = val_data.map(format_chat, remove_columns=["messages", "id"])
+                                  val_data.save_to_disk(val_cache)
+                                  print(f"[Rank {world_rank}] Saved {len(val_data)} validation examples")
+                          else:
+                              print(f"[Rank {world_rank}] Using cached data")
+                          
+                          fcntl.flock(f, fcntl.LOCK_UN)
+                  else:
+                      print(f"[Rank {world_rank}] Waiting for data cache...")
+                      while not os.path.exists(f"{train_cache}/dataset_info.json"):
+                          time.sleep(5)
+                  
+                  train_data = Dataset.load_from_disk(train_cache)
+                  val_data = Dataset.load_from_disk(val_cache) if os.path.exists(f"{val_cache}/dataset_info.json") else None
+                  print(f"[Rank {world_rank}] Loaded {len(train_data)} training examples")
+                  
+                  # SFTConfig (replaces TrainingArguments for TRL)
+                  # NOTE: Gradient checkpointing disabled due to DeepSpeed ZeRO-2 + LoRA incompatibility
+                  # With 16x H100 80GB and batch_size=4, we should fit without gradient checkpointing
+                  training_cfg = config["training"]
+                  sft_config = SFTConfig(
+                      output_dir=training_cfg["output_dir"],
+                      num_train_epochs=training_cfg.get("num_train_epochs", 3),
+                      per_device_train_batch_size=4,  # Reduced from 16 since no grad checkpointing
+                      per_device_eval_batch_size=4,
+                      gradient_accumulation_steps=8,  # Increased to maintain effective batch of 512
+                      learning_rate=training_cfg.get("learning_rate", 1.5e-4),
+                      lr_scheduler_type=training_cfg.get("lr_scheduler_type", "cosine"),
+                      warmup_ratio=training_cfg.get("warmup_ratio", 0.03),
+                      weight_decay=training_cfg.get("weight_decay", 0.01),
+                      logging_steps=training_cfg.get("logging_steps", 10),
+                      save_steps=training_cfg.get("save_steps", 200),
+                      eval_strategy="steps" if val_data else "no",
+                      eval_steps=training_cfg.get("eval_steps", 200) if val_data else None,
+                      save_total_limit=training_cfg.get("save_total_limit", 3),
+                      bf16=True,
+                      gradient_checkpointing=False,  # Disabled - causes issues with DeepSpeed ZeRO + LoRA
+                      max_length=max_length,  # max_length (not max_seq_length) in new TRL API
+                      dataset_text_field="text",
+                      report_to=["wandb"] if os.getenv("WANDB_API_KEY") else ["none"],
+                      run_name=config.get("wandb", {}).get("run_name", "llama3-function-calling"),
+                      ddp_find_unused_parameters=False,
+                  )
+                  
+                  # SFTTrainer handles PEFT + DeepSpeed integration automatically
+                  trainer = SFTTrainer(
+                      model=model,
+                      processing_class=tokenizer,
+                      args=sft_config,
+                      train_dataset=train_data,
+                      eval_dataset=val_data,
+                      peft_config=peft_config,
+                  )
+                  
+                  # Print model info
+                  trainer.accelerator.print(f"{trainer.model}")
+                  if hasattr(trainer.model, "print_trainable_parameters"):
+                      trainer.model.print_trainable_parameters()
+                  
+                  # Train
+                  print(f"[Rank {world_rank}] Starting training...")
+                  trainer.train()
+                  
+                  # Save final model
+                  print(f"[Rank {world_rank}] Saving final model...")
+                  if trainer.is_fsdp_enabled:
+                      trainer.accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
+                  trainer.save_model()
+                  
+                  print(f"[Rank {world_rank}] Training complete!")
+              
+              if __name__ == "__main__":
+                  main()
+              TRAIN_EOF
+              
+              # Copy config
+              cp /config/train_config.yaml configs/train_config.yaml
+              
+              # Determine node rank from pod name (llama3-training-0 -> 0, llama3-training-1 -> 1)
+              NODE_RANK=${POD_NAME##*-}
+              GPUS_PER_NODE=8
+              
+              echo "Starting training on node ${NODE_RANK} (${POD_NAME})..."
+              echo "Master: ${MASTER_ADDR}:${MASTER_PORT}"
+              echo "World size: ${WORLD_SIZE}"
+              
+              # Update accelerate config with node rank
+              sed -i "s/machine_rank: \${NODE_RANK}/machine_rank: ${NODE_RANK}/" configs/accelerate_config.yaml
+              
+              # Wait for master to be ready (if not master)
+              if [ "$NODE_RANK" != "0" ]; then
+                echo "Waiting for master node..."
+                python3 -c "
+              import socket, time
+              while True:
+                  try:
+                      s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                      s.settimeout(2)
+                      s.connect(('${MASTER_ADDR}', ${MASTER_PORT}))
+                      s.close()
+                      print('Master is ready!')
+                      break
+                  except:
+                      time.sleep(2)
+              "
+              fi
+              
+              # Launch with Accelerate (official approach for DeepSpeed + PEFT)
+              accelerate launch \
+                --config_file configs/accelerate_config.yaml \
+                --main_process_ip ${MASTER_ADDR} \
+                --main_process_port ${MASTER_PORT} \
+                --machine_rank ${NODE_RANK} \
+                --num_machines 2 \
+                --num_processes 16 \
+                src/training/train.py
+          
+          resources:
+            limits:
+              nvidia.com/gpu: 8
+              memory: "400Gi"
+            requests:
+              nvidia.com/gpu: 8
+              memory: "200Gi"
+          
+          volumeMounts:
+            - name: data
+              mountPath: /mnt/data
+            - name: config
+              mountPath: /config
+            - name: shm
+              mountPath: /dev/shm
+          
+          ports:
+            - containerPort: 29500
+              name: nccl
+      
+      volumes:
+        - name: data
+          hostPath:
+            path: /mnt/data
+            type: Directory
+        - name: config
+          configMap:
+            name: training-config
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi

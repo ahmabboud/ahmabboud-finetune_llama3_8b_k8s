@@ -7,7 +7,7 @@ ssh_public_key = {
 
 # K8s nodes
 cpu_nodes_count           = 2 # Number of CPU nodes
-gpu_nodes_count_per_group = 2 # Number of GPU nodes per group
+gpu_nodes_count_per_group = 2 # Number of GPU nodes per group (temporarily 0 to switch fabric)
 gpu_node_groups           = 1 # In case you need more then 100 nodes in cluster you have to put multiple node groups
 # CPU platform and presets: https://docs.nebius.com/compute/virtual-machines/types#cpu-configurations
 cpu_nodes_platform = "cpu-d3"     # CPU nodes platform
@@ -16,7 +16,7 @@ cpu_nodes_preset   = "4vcpu-16gb" # CPU nodes preset
 gpu_nodes_platform = "gpu-h100-sxm"        # GPU nodes platform: gpu-h100-sxm, gpu-h200-sxm, gpu-b200-sxm
 gpu_nodes_preset   = "8gpu-128vcpu-1600gb" # GPU nodes preset: 8gpu-128vcpu-1600gb, 8gpu-128vcpu-1600gb, 8gpu-160vcpu-1792gb
 # Infiniband fabrics: https://docs.nebius.com/compute/clusters/gpu#fabrics
-infiniband_fabric = "fabric-6" # Infiniband fabric name
+infiniband_fabric = "fabric-2" # Infiniband fabric name (switched from fabric-6)
 
 gpu_nodes_driverfull_image = true
 enable_k8s_node_group_sa   = true
@@ -30,7 +30,7 @@ gpu_nodes_preemptible      = false
 
 # Observability
 enable_prometheus = true  # Enable or disable Prometheus and Grafana deployment with true or false
-enable_loki       = false # Enable or disable Loki deployment with true or false
+enable_loki       = true # Enable or disable Loki deployment with true or false
 
 # Storage
 enable_filestore     = true                            # Enable or disable Filestore integration with true or false

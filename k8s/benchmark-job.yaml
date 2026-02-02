@@ -1,0 +1,69 @@
+---
+# Benchmark job to verify GPU cluster performance
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gpu-benchmark
+  namespace: default
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+      
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+      
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      
+      containers:
+        - name: benchmark
+          image: nvcr.io/nvidia/pytorch:24.07-py3
+          
+          env:
+            - name: NCCL_DEBUG
+              value: "INFO"
+          
+          command:
+            - /bin/bash
+            - -c
+            - |
+              echo "=========================================="
+              echo " GPU Cluster Benchmark"
+              echo "=========================================="
+              
+              # Show GPU info
+              nvidia-smi
+              
+              # Run benchmark
+              cd /mnt/data/app
+              torchrun --nproc_per_node=8 scripts/benchmark.py
+          
+          resources:
+            requests:
+              nvidia.com/gpu: 8
+              memory: "100Gi"
+            limits:
+              nvidia.com/gpu: 8
+              memory: "200Gi"
+          
+          volumeMounts:
+            - name: shared-data
+              mountPath: /mnt/data
+            - name: shm
+              mountPath: /dev/shm
+      
+      volumes:
+        - name: shared-data
+          hostPath:
+            path: /mnt/data
+            type: Directory
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: "32Gi"

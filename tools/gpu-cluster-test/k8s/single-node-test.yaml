@@ -1,0 +1,305 @@
+###############################################################################
+# GPU Cluster Test - Single Node
+#
+# Usage:
+#   kubectl apply -f single-node-test.yaml
+#   kubectl logs -f gpu-cluster-test
+#   kubectl delete job gpu-cluster-test
+###############################################################################
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gpu-cluster-test
+  labels:
+    app: gpu-cluster-test
+    test-type: single-node
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: gpu-cluster-test
+    spec:
+      restartPolicy: Never
+      
+      containers:
+      - name: test
+        # Use pre-built image or NGC base
+        image: nvcr.io/nvidia/pytorch:24.12-py3
+        
+        resources:
+          requests:
+            nvidia.com/gpu: "8"
+          limits:
+            nvidia.com/gpu: "8"
+        
+        securityContext:
+          capabilities:
+            add: [IPC_LOCK, SYS_RESOURCE]
+        
+        env:
+          - name: GPUS_PER_NODE
+            value: "8"
+          - name: NNODES
+            value: "1"
+          - name: NCCL_DEBUG
+            value: "WARN"
+          - name: NCCL_IB_DISABLE
+            value: "0"
+        
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -e
+          ulimit -l unlimited
+          
+          # Install dependencies
+          pip install -q transformers datasets accelerate
+          
+          # Run test
+          python /workspace/gpu_test.py --output /tmp/report.json
+          
+          # Print report
+          cat /tmp/report.json
+
+        volumeMounts:
+        - name: test-script
+          mountPath: /workspace/gpu_test.py
+          subPath: gpu_test.py
+      
+      volumes:
+      - name: test-script
+        configMap:
+          name: gpu-cluster-test-config
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-cluster-test-config
+data:
+  gpu_test.py: |
+    #!/usr/bin/env python3
+    """GPU Cluster Acceptance Test - Embedded Version"""
+    
+    import os, sys, time, json, socket, argparse, subprocess
+    from datetime import datetime
+    from dataclasses import dataclass, asdict
+    from typing import List, Dict, Any, Optional
+    
+    @dataclass
+    class TestResult:
+        name: str
+        passed: bool
+        message: str
+        details: Optional[Dict[str, Any]] = None
+    
+    class GPUClusterTest:
+        GPU_FAMILIES = ["H100", "H200", "B100", "B200", "A100"]
+        
+        def __init__(self, args):
+            self.args = args
+            self.results: List[TestResult] = []
+            self.rank = int(os.environ.get("RANK", 0))
+            self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            self.world_size = int(os.environ.get("WORLD_SIZE", 1))
+            self.is_distributed = self.world_size > 1
+            self.cluster_info: Dict[str, Any] = {}
+        
+        def log(self, msg: str):
+            if self.rank == 0: print(msg)
+        
+        def run_cmd(self, cmd, timeout=30):
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+                return r.returncode, r.stdout, r.stderr
+            except: return -1, "", "error"
+        
+        def add_result(self, name, passed, message, details=None):
+            self.results.append(TestResult(name, passed, message, details))
+            if self.rank == 0:
+                print(f"  {'✓' if passed else '✗'} {name}: {message}")
+        
+        def test_gpu_detection(self):
+            self.log("\n[1/7] GPU Detection...")
+            code, out, _ = self.run_cmd(["nvidia-smi", "--query-gpu=name,memory.total,temperature.gpu", "--format=csv,noheader"])
+            if code != 0:
+                self.add_result("GPU Detection", False, "nvidia-smi failed")
+                return False
+            
+            gpus = [l.strip() for l in out.strip().split("\n") if l]
+            num_gpus = len(gpus)
+            expected = int(os.environ.get("GPUS_PER_NODE", 8))
+            
+            gpu_family = "Unknown"
+            if gpus:
+                for fam in self.GPU_FAMILIES:
+                    if fam in gpus[0]: gpu_family = fam; break
+            
+            self.cluster_info["gpu_family"] = gpu_family
+            self.cluster_info["num_gpus"] = num_gpus
+            self.add_result("GPU Detection", num_gpus >= expected, f"{num_gpus}x {gpu_family}")
+            return num_gpus >= expected
+        
+        def test_cuda_pytorch(self):
+            self.log("\n[2/7] CUDA/PyTorch...")
+            import torch
+            if not torch.cuda.is_available():
+                self.add_result("CUDA/PyTorch", False, "CUDA not available")
+                return False
+            
+            bf16 = torch.cuda.is_bf16_supported()
+            cap = torch.cuda.get_device_capability(0)
+            self.cluster_info["cuda"] = {"pytorch": torch.__version__, "cuda": torch.version.cuda}
+            self.add_result("CUDA/PyTorch", True, f"PyTorch {torch.__version__}, CUDA {torch.version.cuda}, Compute {cap[0]}.{cap[1]}, bf16={'yes' if bf16 else 'no'}")
+            return True
+        
+        def test_memory_limits(self):
+            self.log("\n[3/7] Memory Limits...")
+            try:
+                with open("/proc/1/limits") as f:
+                    content = f.read()
+                for line in content.split("\n"):
+                    if "locked" in line.lower():
+                        is_unlimited = "unlimited" in line
+                        self.add_result("Memory Limits", is_unlimited, "memlock unlimited" if is_unlimited else "memlock LIMITED")
+                        return is_unlimited
+            except Exception as e:
+                self.add_result("Memory Limits", False, str(e))
+            return False
+        
+        def test_infiniband(self):
+            self.log("\n[4/7] InfiniBand...")
+            code, out, _ = self.run_cmd(["ibv_devinfo"])
+            if code != 0:
+                self.add_result("InfiniBand", True, "Not available (using Ethernet)")
+                return True
+            hcas = out.count("hca_id:")
+            active = out.count("PORT_ACTIVE")
+            self.add_result("InfiniBand", active > 0, f"{hcas} HCA(s), {active} active")
+            return active > 0
+        
+        def test_nccl(self):
+            self.log("\n[5/7] NCCL...")
+            import torch
+            num_gpus = torch.cuda.device_count()
+            nccl_ver = ".".join(map(str, torch.cuda.nccl.version()))
+            p2p = sum(1 for i in range(num_gpus) for j in range(num_gpus) if i != j and torch.cuda.can_device_access_peer(i, j))
+            p2p_total = num_gpus * (num_gpus - 1)
+            self.add_result("NCCL", True, f"NCCL {nccl_ver}, P2P {p2p}/{p2p_total}")
+            return True
+        
+        def test_storage_io(self):
+            self.log("\n[6/7] Storage I/O...")
+            try:
+                data = os.urandom(1024*1024)
+                t0 = time.time()
+                with open("/tmp/test.bin", "wb") as f:
+                    for _ in range(100): f.write(data)
+                    f.flush(); os.fsync(f.fileno())
+                write_speed = 100 / (time.time() - t0)
+                t0 = time.time()
+                with open("/tmp/test.bin", "rb") as f:
+                    while f.read(1024*1024): pass
+                read_speed = 100 / (time.time() - t0)
+                os.remove("/tmp/test.bin")
+                self.add_result("Storage I/O", write_speed > 50, f"Write: {write_speed:.0f} MB/s, Read: {read_speed:.0f} MB/s")
+                return True
+            except Exception as e:
+                self.add_result("Storage I/O", False, str(e))
+                return False
+        
+        def test_training(self):
+            self.log("\n[7/7] Training (GPT-2)...")
+            import torch
+            import torch.nn as nn
+            import torch.distributed as dist
+            
+            device = f"cuda:{self.local_rank}"
+            torch.cuda.set_device(device)
+            
+            if self.is_distributed and not dist.is_initialized():
+                dist.init_process_group(backend="nccl")
+            
+            try:
+                from transformers import GPT2Config, GPT2LMHeadModel
+                config = GPT2Config(vocab_size=50257, n_positions=512, n_embd=768, n_layer=6, n_head=12)
+                model = GPT2LMHeadModel(config).to(device)
+                
+                if self.is_distributed:
+                    model = nn.parallel.DistributedDataParallel(model, device_ids=[self.local_rank])
+                
+                optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+                input_ids = torch.randint(0, 50257, (4, 512), device=device)
+                
+                # Warmup
+                outputs = model(input_ids, labels=input_ids)
+                outputs.loss.backward(); optimizer.step(); optimizer.zero_grad()
+                torch.cuda.synchronize()
+                if self.is_distributed: dist.barrier()
+                
+                # Benchmark
+                torch.cuda.reset_peak_memory_stats()
+                t0 = time.time()
+                for _ in range(self.args.test_steps):
+                    outputs = model(input_ids, labels=input_ids)
+                    outputs.loss.backward(); optimizer.step(); optimizer.zero_grad()
+                torch.cuda.synchronize()
+                if self.is_distributed: dist.barrier()
+                
+                step_ms = (time.time() - t0) / self.args.test_steps * 1000
+                throughput = 4 * 512 * self.world_size / (step_ms / 1000)
+                mem_gb = torch.cuda.max_memory_allocated(device) / 1e9
+                
+                del model, optimizer; torch.cuda.empty_cache()
+                self.add_result("Training", True, f"{step_ms:.0f}ms/step, {throughput:.0f} tok/s, {mem_gb:.1f}GB")
+                return True
+            except Exception as e:
+                self.add_result("Training", False, str(e))
+                return False
+        
+        def run(self):
+            self.log("=" * 60)
+            self.log("GPU CLUSTER ACCEPTANCE TEST")
+            self.log("=" * 60)
+            self.log(f"Hostname: {socket.gethostname()}")
+            self.log(f"World Size: {self.world_size}")
+            self.log("=" * 60)
+            
+            self.test_gpu_detection()
+            self.test_cuda_pytorch()
+            self.test_memory_limits()
+            self.test_infiniband()
+            self.test_nccl()
+            self.test_storage_io()
+            self.test_training()
+            
+            passed = sum(1 for r in self.results if r.passed)
+            failed = sum(1 for r in self.results if not r.passed)
+            
+            self.log("\n" + "=" * 60)
+            self.log(f"PASSED: {passed}  FAILED: {failed}")
+            self.log("=" * 60)
+            self.log("✓ CLUSTER READY" if failed == 0 else "✗ FIX FAILURES ABOVE")
+            self.log("=" * 60)
+            
+            if self.rank == 0 and self.args.output:
+                report = {"timestamp": datetime.now().isoformat(), "hostname": socket.gethostname(),
+                          "world_size": self.world_size, "passed": passed, "failed": failed,
+                          "results": [asdict(r) for r in self.results], "cluster_info": self.cluster_info}
+                with open(self.args.output, "w") as f: json.dump(report, f, indent=2)
+            
+            return failed == 0
+    
+    if __name__ == "__main__":
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--test-steps", type=int, default=10)
+        parser.add_argument("--output", "-o")
+        args = parser.parse_args()
+        
+        tester = GPUClusterTest(args)
+        success = tester.run()
+        
+        import torch.distributed as dist
+        if dist.is_initialized(): dist.destroy_process_group()
+        sys.exit(0 if success else 1)

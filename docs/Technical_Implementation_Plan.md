@@ -123,7 +123,7 @@ Before proceeding with the implementation, the following requirements must be me
   - [ ] Check GPU metrics: `DCGM_FI_DEV_GPU_UTIL`, `DCGM_FI_DEV_MEM_COPY_UTIL`
 
 - [ ] **Access Grafana Dashboard:**
-  - [ ] Port-forward: `kubectl -n o11y port-forward svc/grafana 8080:80`
+  - [ ] Port-forward: `kubectl -n o11y port-forward svc/grafana-and-prometheus 8080:80`
   - [ ] View GPU utilization dashboards
 
 - [ ] **Experiment Tracking:**

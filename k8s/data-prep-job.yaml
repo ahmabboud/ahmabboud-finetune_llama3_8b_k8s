@@ -1,0 +1,71 @@
+---
+# Job to prepare training data
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: prepare-training-data
+  namespace: default
+spec:
+  template:
+    metadata:
+      labels:
+        app: data-preparation
+    spec:
+      restartPolicy: Never
+      
+      containers:
+        - name: data-prep
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+          
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+          
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              
+              echo "Installing dependencies..."
+              pip install -q datasets transformers tqdm torch
+              
+              echo "Setting up directories..."
+              mkdir -p /mnt/data/datasets
+              mkdir -p /mnt/data/cache
+              
+              echo "Copying source code..."
+              cd /mnt/data/app
+              
+              echo "Running data preparation..."
+              python scripts/prepare_data.py \
+                --dataset glaiveai/glaive-function-calling-v2 \
+                --format glaive \
+                --output-dir /mnt/data/datasets \
+                --cache-dir /mnt/data/cache \
+                --train-ratio 0.95
+              
+              echo "Data preparation complete!"
+              ls -la /mnt/data/datasets/
+          
+          resources:
+            requests:
+              memory: "8Gi"
+              cpu: "4"
+            limits:
+              memory: "16Gi"
+              cpu: "8"
+          
+          volumeMounts:
+            - name: shared-data
+              mountPath: /mnt/data
+      
+      volumes:
+        - name: shared-data
+          hostPath:
+            path: /mnt/data
+            type: Directory
