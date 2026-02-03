@@ -93,6 +93,14 @@ configuration:
                       value: http://{{ .Release.Name }}-grafana:80
                     - name: RAY_PROMETHEUS_HOST
                       value: http://{{- printf "%s-%s" .Release.Name "kube-prometheus-stack" | trunc 26 | trimSuffix "-" -}}-prometheus:9090
+                  volumeMounts:
+                    - name: shared-data
+                      mountPath: /mnt/data
+              volumes:
+                - name: shared-data
+                  hostPath:
+                    path: /mnt/data
+                    type: Directory
         workerGroupSpecs:
           - groupName: cpu-worker
             replicas: ${min_cpu_replicas}
@@ -113,6 +121,14 @@ configuration:
                       limits:
                         cpu: ${cpu_resources.cpus}
                         memory: ${cpu_resources.memory}Gi
+                    volumeMounts:
+                      - name: shared-data
+                        mountPath: /mnt/data
+                volumes:
+                  - name: shared-data
+                    hostPath:
+                      path: /mnt/data
+                      type: Directory
           - groupName: gpu-worker
             replicas: ${min_gpu_replicas}
             minReplicas: ${min_gpu_replicas}
@@ -139,6 +155,14 @@ configuration:
                         cpu: ${gpu_resources.cpus}
                         memory: ${gpu_resources.memory}Gi
                         nvidia.com/gpu: ${gpu_resources.gpus}
+                    volumeMounts:
+                      - name: shared-data
+                        mountPath: /mnt/data
+                volumes:
+                  - name: shared-data
+                    hostPath:
+                      path: /mnt/data
+                      type: Directory
 kube-prometheus-stack:
   enabled: true
   grafana:

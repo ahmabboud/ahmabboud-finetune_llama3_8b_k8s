@@ -41,7 +41,7 @@ filestore_block_size = 4096                            # Set Filestore block siz
 # KubeRay
 # for GPU isolation to work with kuberay, gpu_nodes_driverfull_image must be set 
 # to false.  This is because we enable acess to infiniband via securityContext.privileged
-enable_kuberay = false # Turn KubeRay to false, otherwise gpu capacity will be consumed by KubeRay cluster
+enable_kuberay = true # Enable KubeRay for distributed ML workloads
 
 #kuberay CPU worker setup
 # if you have no CPU only nodes, set these to zero
@@ -56,12 +56,12 @@ kuberay_max_cpu_replicas = 2
 #kuberay GPU worker pod setup
 # kuberay_gpu_worker_image = "" # set default gpu worker image see ../modules/kuberay/README.md for more info
 kuberay_min_gpu_replicas = 2
-kuberay_max_gpu_replicas = 8
-# kuberay_gpu_resources = {
-#   cpus = 16
-#   gpus = 1
-#   memory = 150  # memory allocation in gigabytes
-# }
+kuberay_max_gpu_replicas = 2  # Max 2 nodes (each with 8 GPUs)
+kuberay_gpu_resources = {
+  cpus   = 120
+  gpus   = 8     # All 8 H100s per node
+  memory = 1400  # ~1400 GB per node
+}
 
 # NPD nebius-gpu-health-checker helm install
 gpu_health_cheker = false
