@@ -54,7 +54,7 @@ kuberay_max_cpu_replicas = 2
 # }
 
 #kuberay GPU worker pod setup
-# kuberay_gpu_worker_image = "" # set default gpu worker image see ../modules/kuberay/README.md for more info
+kuberay_gpu_worker_image = "cr.eu-north1.nebius.cloud/e00tnz9wpyxva2s992/ray-gpu-infiniband:2.46.0-py310"
 kuberay_min_gpu_replicas = 2
 kuberay_max_gpu_replicas = 2  # Max 2 nodes (each with 8 GPUs)
 kuberay_gpu_resources = {

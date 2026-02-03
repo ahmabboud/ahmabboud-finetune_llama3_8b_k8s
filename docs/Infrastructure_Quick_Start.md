@@ -53,10 +53,21 @@ ssh_public_key = {
 gpu_nodes_count_per_group = 2          # Number of GPU nodes
 gpu_nodes_platform = "gpu-h100-sxm"    # H100 GPUs
 gpu_nodes_preset = "8gpu-128vcpu-1600gb"
-infiniband_fabric = "fabric-6"         # Check availability
+infiniband_fabric = "fabric-2"         # Check availability
 
 # Storage
 filestore_disk_size = 2 * (1024 * 1024 * 1024 * 1024)  # 2TB
+
+# KubeRay (for Ray Train distributed training)
+enable_kuberay = true
+kuberay_gpu_worker_image = "cr.eu-north1.nebius.cloud/<registry-id>/ray-gpu-infiniband:2.46.0-py310"
+kuberay_min_gpu_replicas = 2
+kuberay_max_gpu_replicas = 2
+kuberay_gpu_resources = {
+  cpus   = 120
+  gpus   = 8
+  memory = 1400
+}
 ```
 
 ### 3. Deploy
@@ -116,6 +127,56 @@ kubectl -n o11y port-forward svc/grafana-and-prometheus 8080:80
 |-----------|---------|
 | Node Exporter | CPU, memory, disk metrics |
 | NVIDIA DCGM | GPU utilization, memory, temperature |
+
+---
+
+## KubeRay Cluster
+
+If `enable_kuberay = true` is set, a Ray cluster is deployed for distributed training.
+
+### Check KubeRay Status
+
+```bash
+# Check Ray cluster
+kubectl get raycluster -n ray-cluster
+
+# Check all Ray pods
+kubectl get pods -n ray-cluster
+
+# Check GPU workers
+kubectl get pods -n ray-cluster -l ray.io/group=gpu-worker
+```
+
+### Access Ray Dashboard
+
+```bash
+kubectl -n ray-cluster port-forward svc/ray-cluster-kuberay-head-svc 8265:8265
+# Open http://localhost:8265
+```
+
+### Build InfiniBand-Enabled Ray Image
+
+For multi-node training with NCCL over InfiniBand, you need a custom Ray image:
+
+```bash
+# Configure Docker for Nebius Container Registry
+nebius registry configure-helper
+
+# Build and push the image
+cd infra/modules/kuberay/kuberay-tests/ray-infiniband
+docker buildx build --platform linux/amd64 \
+  -t cr.eu-north1.nebius.cloud/<registry-id>/ray-gpu-infiniband:2.46.0-py310 \
+  --push .
+```
+
+### Verify InfiniBand in Ray Workers
+
+```bash
+# Check that InfiniBand is working
+kubectl exec -n ray-cluster <gpu-worker-pod> -- ibstat
+
+# Expected output shows mlx5 devices with State: Active
+```
 
 ---
 
@@ -292,6 +353,28 @@ Then apply:
 terraform apply
 ```
 
+### Scaling to 512 GPUs (64 Nodes)
+
+For large-scale deployments, update multiple parameters:
+
+```hcl
+# terraform.tfvars - 512 GPU configuration
+gpu_nodes_count_per_group = 64      # 64 nodes × 8 GPUs = 512 GPUs
+
+# Storage: Scale up for 64 nodes
+filestore_disk_size = 32 * (1024 * 1024 * 1024 * 1024)  # 32TB
+
+# KubeRay: Match GPU node count
+kuberay_min_gpu_replicas = 64
+kuberay_max_gpu_replicas = 64
+```
+
+**Important considerations:**
+1. Check InfiniBand fabric capacity: `nebius compute v1 infiniband list`
+2. Request GPU quota increase from Nebius support if needed
+3. Deployment takes ~45-60 minutes for 64 nodes
+4. See [Training Guide - Scaling to 512 GPUs](Training_Guide.md#scaling-to-512-h100-gpus-64-nodes) for training config changes
+
 ### Destroy Infrastructure
 
 ```bash
@@ -388,4 +471,4 @@ alias gpus='kubectl describe nodes | grep -A5 "nvidia.com/gpu"'
 
 ---
 
-*Last updated: 2026-02-01*
+*Last updated: 2026-02-02*

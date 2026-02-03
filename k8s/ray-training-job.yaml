@@ -15,46 +15,27 @@ metadata:
   namespace: ray-cluster
 spec:
   # Automatically delete job after completion
-  ttlSecondsAfterFinished: 3600
+  ttlSecondsAfterFinished: 7200
   shutdownAfterJobFinishes: true
   
-  # Job entrypoint - simple GPU test first
-  entrypoint: |
-    python -c "
-    import ray
-    import torch
-    
-    ray.init()
-    print(f'Ray resources: {ray.cluster_resources()}')
-    
-    @ray.remote(num_gpus=1)
-    def check_gpu():
-        import torch
-        gpu_count = torch.cuda.device_count()
-        gpu_name = torch.cuda.get_device_name(0) if gpu_count > 0 else 'None'
-        memory = torch.cuda.get_device_properties(0).total_memory / 1e9 if gpu_count > 0 else 0
-        return {'gpu_count': gpu_count, 'gpu_name': gpu_name, 'memory_gb': memory}
-    
-    # Test on each GPU worker
-    futures = [check_gpu.remote() for _ in range(2)]
-    results = ray.get(futures)
-    for i, r in enumerate(results):
-        print(f'Worker {i}: {r}')
-    
-    print('Ray GPU test completed successfully!')
-    "
+  # Job entrypoint - run training script from shared filesystem
+  entrypoint: "python /mnt/data/ray-train.py"
   
-  # Runtime environment - using pre-installed packages in GPU worker image
+  # Runtime environment
   runtimeEnvYAML: |
     env_vars:
       HF_HOME: "/mnt/data/cache/huggingface"
       NCCL_DEBUG: "INFO"
+      NCCL_IB_DISABLE: "0"
+      NCCL_NET_GDR_LEVEL: "2"
     pip:
+      - torch==2.5.1
       - transformers==4.46.3
       - peft==0.13.2
       - accelerate==1.1.1
-      - trl
+      - trl==0.11.4
       - datasets
+      - bitsandbytes
   
   # Use existing Ray cluster
   clusterSelector:
@@ -119,31 +100,29 @@ data:
     
     def train_func():
         """Training function executed on each worker."""
-        # Get distributed training context
+        # Get distributed training context from Ray
         world_size = train.get_context().get_world_size()
         rank = train.get_context().get_world_rank()
         local_rank = train.get_context().get_local_rank()
         
-        print(f"Worker {rank}/{world_size} starting on local_rank {local_rank}")
-        
-        # Set device
-        device = torch.device(f"cuda:{local_rank}")
-        torch.cuda.set_device(device)
+        print(f"Worker {rank}/{world_size} starting (local_rank={local_rank})")
         
         # Load tokenizer
         tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "right"
         
-        # Load model
+        # Load model - let FSDP handle placement
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME,
             torch_dtype=torch.bfloat16,
-            device_map={"": device},
+            use_cache=False,  # Required for gradient checkpointing
         )
         
-        # Apply LoRA
+        # Apply LoRA before FSDP wrapping
         model = get_peft_model(model, LORA_CONFIG)
+        model.enable_input_require_grads()
+        
         if rank == 0:
             model.print_trainable_parameters()
         
@@ -154,7 +133,7 @@ data:
         train_data = train_data.map(format_function_calling)
         val_data = val_data.map(format_function_calling)
         
-        # Training arguments
+        # Training arguments with DDP (FSDP requires multi-GPU per process)
         training_args = TrainingArguments(
             output_dir=OUTPUT_DIR,
             num_train_epochs=3,
@@ -172,9 +151,10 @@ data:
             save_total_limit=3,
             bf16=True,
             gradient_checkpointing=True,
+            gradient_checkpointing_kwargs={"use_reentrant": False},
             dataloader_num_workers=4,
             ddp_find_unused_parameters=False,
-            report_to="none",  # Disable wandb for now
+            report_to="none",
         )
         
         # Create trainer
@@ -205,13 +185,14 @@ data:
         
         print(f"Ray cluster resources: {ray.cluster_resources()}")
         
-        # Configure distributed training
+        # Configure distributed training - 16 workers with 1 GPU each
+        # Uses DDP for data parallelism across all GPUs
         trainer = TorchTrainer(
             train_func,
             scaling_config=ScalingConfig(
-                num_workers=2,           # 2 GPU nodes
+                num_workers=16,          # 16 total GPUs
                 use_gpu=True,
-                resources_per_worker={"GPU": 8, "CPU": 16},  # 8 GPUs per node
+                resources_per_worker={"GPU": 1, "CPU": 8},
             ),
             run_config=RunConfig(
                 name="llama3-finetuning",

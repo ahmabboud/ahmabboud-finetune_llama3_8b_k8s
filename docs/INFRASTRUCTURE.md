@@ -189,6 +189,86 @@ Training pods discover each other via DNS:
 
 NCCL uses InfiniBand RDMA for efficient GPU-to-GPU communication across nodes.
 
+## KubeRay (Ray Cluster)
+
+When `enable_kuberay = true`, a Ray cluster is deployed for distributed training.
+
+### KubeRay Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    ray-cluster namespace                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────┐     │
+│  │                         Ray Head Pod                                │     │
+│  │  - GCS (Global Control Store)                                      │     │
+│  │  - Dashboard (port 8265)                                           │     │
+│  │  - Job submission service                                          │     │
+│  └────────────────────────────────────────────────────────────────────┘     │
+│                              │                                               │
+│              ┌───────────────┴───────────────┐                              │
+│              ▼                               ▼                              │
+│  ┌─────────────────────┐      ┌─────────────────────┐                       │
+│  │  GPU Worker Pod 1   │      │  GPU Worker Pod 2   │                       │
+│  │  8x H100 80GB       │◄────►│  8x H100 80GB       │                       │
+│  │  InfiniBand image   │  IB  │  InfiniBand image   │                       │
+│  │  /mnt/data mounted  │      │  /mnt/data mounted  │                       │
+│  └─────────────────────┘      └─────────────────────┘                       │
+│              │                               │                              │
+│              └───────────────┬───────────────┘                              │
+│                              ▼                                               │
+│  ┌────────────────────────────────────────────────────────────────────┐     │
+│  │              Shared Filesystem (/mnt/data)                          │     │
+│  └────────────────────────────────────────────────────────────────────┘     │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### KubeRay Configuration (Terraform)
+
+```hcl
+# terraform.tfvars
+enable_kuberay = true
+kuberay_gpu_worker_image = "cr.eu-north1.nebius.cloud/<registry-id>/ray-gpu-infiniband:2.46.0-py310"
+kuberay_min_gpu_replicas = 2
+kuberay_max_gpu_replicas = 2
+kuberay_gpu_resources = {
+  cpus   = 120
+  gpus   = 8     # All 8 H100s per node
+  memory = 1400  # GB
+}
+```
+
+### InfiniBand-Enabled Ray Image
+
+For NCCL to use InfiniBand RDMA across nodes, the Ray GPU workers need the `ibverbs` userland libraries. The standard Ray GPU image doesn't include these.
+
+Custom Dockerfile (`infra/modules/kuberay/kuberay-tests/ray-infiniband/Dockerfile`):
+
+```dockerfile
+FROM rayproject/ray:2.46.0-py310-gpu
+RUN sudo apt update && sudo apt install -y \
+    kmod infiniband-diags ibverbs-utils libibverbs-dev perftest net-tools
+```
+
+Build and push to Nebius Container Registry:
+
+```bash
+nebius registry configure-helper
+docker buildx build --platform linux/amd64 \
+  -t cr.eu-north1.nebius.cloud/<registry-id>/ray-gpu-infiniband:2.46.0-py310 \
+  --push .
+```
+
+### KubeRay Services
+
+| Service | Port | Purpose |
+|---------|------|---------|
+| `ray-cluster-kuberay-head-svc` | 8265 | Ray Dashboard & Job submission |
+| `ray-cluster-kuberay-head-svc` | 6379 | Ray GCS (internal) |
+| `ray-cluster-kuberay-head-svc` | 10001 | Ray Client (internal) |
+
 ### Required Security Capabilities
 
 For InfiniBand RDMA to work, pods need:
@@ -301,16 +381,77 @@ kubectl delete pod checkpoint-copy
 cat checkpoint-1000.tar.gz | kubectl exec -i checkpoint-copy -- tar xzf - -C /mnt/data/checkpoints/llama3-function-calling/
 ```
 
-## Cost Considerations
+## Scaling Infrastructure
 
-| Resource | Approximate Cost Factor |
-|----------|------------------------|
-| 2x GPU Nodes (8x H100 each) | Highest cost |
-| 2TB Shared Filesystem | Medium cost |
-| Kubernetes Control Plane | Included |
-| Network Egress | Per GB |
+### Scaling Reference
 
-**Recommendation**: Delete GPU nodes when not training to minimize costs. The filesystem persists independently.
+| Scale | Nodes | GPUs | Storage | InfiniBand |
+|-------|-------|------|---------|------------|
+| Small | 2 | 16 | 2 TB | fabric-2 |
+| Medium | 8 | 64 | 8 TB | fabric-2/3 |
+| Large | 32 | 256 | 16 TB | fabric-3/4 |
+| XL | 64 | 512 | 32 TB | fabric-4/5/6 |
+
+### Terraform Variables for 512 GPUs
+
+```hcl
+# infra/k8s-installation/terraform.tfvars
+
+# GPU nodes: 64 nodes × 8 H100 = 512 GPUs
+gpu_nodes_count_per_group = 64
+gpu_nodes_platform        = "gpu-h100-sxm"
+gpu_nodes_preset          = "8gpu-128vcpu-1600gb"
+infiniband_fabric         = "fabric-4"  # Check capacity
+
+# Storage: Scale for 64 nodes
+filestore_disk_size = 32 * (1024 * 1024 * 1024 * 1024)  # 32TB
+
+# KubeRay (if using Ray Train)
+enable_kuberay           = true
+kuberay_min_gpu_replicas = 64
+kuberay_max_gpu_replicas = 64
+```
+
+### Architecture at 512 GPU Scale
+
+```
+┌────────────────────────────────────────────────────────────────────────────────┐
+│                              Nebius Cloud (512 GPUs)                            │
+├────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+│  │                    Managed Kubernetes Cluster                            │   │
+│  │                                                                          │   │
+│  │   ┌─────────┐ ┌─────────┐ ┌─────────┐       ┌─────────┐                 │   │
+│  │   │ Node 1  │ │ Node 2  │ │ Node 3  │  ...  │ Node 64 │                 │   │
+│  │   │8xH100   │ │8xH100   │ │8xH100   │       │8xH100   │                 │   │
+│  │   │Rank 0-7 │ │Rank 8-15│ │Rank16-23│       │Rank504+ │                 │   │
+│  │   └────┬────┘ └────┬────┘ └────┬────┘       └────┬────┘                 │   │
+│  │        │           │           │                 │                       │   │
+│  │        └───────────┴───────────┴─────────────────┘                       │   │
+│  │                    InfiniBand Fabric (400 Gb/s)                          │   │
+│  │                                                                          │   │
+│  └──────────────────────────────┬───────────────────────────────────────────┘   │
+│                                 │                                               │
+│  ┌──────────────────────────────▼───────────────────────────────────────────┐   │
+│  │              Nebius Shared Filesystem (32 TB SSD)                         │   │
+│  │   - 300 GiB/s aggregate read bandwidth                                   │   │
+│  │   - 100 GiB/s aggregate write bandwidth                                  │   │
+│  │   - Mounted at /mnt/data on all 64 nodes                                 │   │
+│  └──────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+└────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Pre-Scaling Checklist
+
+- [ ] Check InfiniBand fabric capacity: `nebius compute v1 infiniband list`
+- [ ] Verify GPU quota with Nebius support
+- [ ] Plan for ~45-60 min deployment time
+- [ ] Scale storage proportionally (0.5 TB per node minimum)
+- [ ] Test at intermediate scale first (16 → 64 → 256 → 512)
+
+See [Training Guide - Scaling to 512 GPUs](Training_Guide.md#scaling-to-512-h100-gpus-64-nodes) for training configuration.
 
 ## Troubleshooting
 
