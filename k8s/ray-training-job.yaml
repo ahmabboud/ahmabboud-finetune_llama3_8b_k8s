@@ -4,9 +4,20 @@
 # This submits a distributed training job to KubeRay using Ray Train.
 # Uses the same LoRA + FSDP configuration as the StatefulSet training.
 #
-# Usage:
+# MONITORING:
+#   - Wandb: Real-time loss curves at https://wandb.ai (requires WANDB_API_KEY)
+#   - Ray Dashboard: Job status at localhost:8265 (kubectl port-forward)
+#   - TensorBoard: Not enabled by default
+#
+# Usage (without wandb):
 #   kubectl apply -f k8s/ray-training-job.yaml
-#   kubectl logs -f rayjob-llama3-training-xxxxx -n ray-cluster
+#
+# Usage (with wandb - recommended):
+#   export WANDB_API_KEY=$(kubectl get secret wandb-token -n default -o jsonpath='{.data.key}' | base64 -d)
+#   envsubst < k8s/ray-training-job.yaml | kubectl apply -f -
+#
+# Check logs:
+#   kubectl logs -n ray-cluster -l job-name=llama3-finetuning -f
 ###############################################################################
 apiVersion: ray.io/v1
 kind: RayJob
@@ -28,6 +39,9 @@ spec:
       NCCL_DEBUG: "INFO"
       NCCL_IB_DISABLE: "0"
       NCCL_NET_GDR_LEVEL: "2"
+      WANDB_PROJECT: "llama3-function-calling"
+      WANDB_RUN_NAME: "ray-h100-16x-lora"
+      WANDB_API_KEY: "${WANDB_API_KEY}"
     pip:
       - torch==2.5.1
       - transformers==4.46.3
@@ -36,6 +50,7 @@ spec:
       - trl==0.11.4
       - datasets
       - bitsandbytes
+      - wandb
   
   # Use existing Ray cluster
   clusterSelector:
@@ -70,6 +85,7 @@ data:
     from peft import LoraConfig, get_peft_model
     from trl import SFTTrainer
     from datasets import load_dataset
+    import wandb
     
     # Configuration
     MODEL_NAME = "meta-llama/Meta-Llama-3-8B-Instruct"
@@ -87,16 +103,41 @@ data:
     )
     
     def format_function_calling(example):
-        """Format data for function calling training."""
-        system = example.get("system", "You are a helpful assistant.")
-        user = example.get("user", example.get("instruction", ""))
-        assistant = example.get("assistant", example.get("output", ""))
+        """Format data for function calling training.
+        Handles the 'messages' format from function calling datasets.
+        """
+        messages = example.get("messages", [])
         
-        return {
-            "text": f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{system}<|eot_id|>"
-                   f"<|start_header_id|>user<|end_header_id|>\n\n{user}<|eot_id|>"
-                   f"<|start_header_id|>assistant<|end_header_id|>\n\n{assistant}<|eot_id|>"
-        }
+        # Extract messages by role
+        system = ""
+        conversation = []
+        
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            
+            if role == "system":
+                system = content
+            elif role == "user":
+                conversation.append(("user", content))
+            elif role == "assistant":
+                conversation.append(("assistant", content))
+            elif role == "tool":
+                # Tool responses are typically followed by assistant messages
+                conversation.append(("tool", content))
+        
+        # Build formatted text in Llama-3 chat format
+        text = f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{system}<|eot_id|>"
+        
+        for role, content in conversation:
+            if role == "user":
+                text += f"<|start_header_id|>user<|end_header_id|>\n\n{content}<|eot_id|>"
+            elif role == "assistant":
+                text += f"<|start_header_id|>assistant<|end_header_id|>\n\n{content}<|eot_id|>"
+            elif role == "tool":
+                text += f"<|start_header_id|>tool<|end_header_id|>\n\n{content}<|eot_id|>"
+        
+        return {"text": text}
     
     def train_func():
         """Training function executed on each worker."""
@@ -106,7 +147,20 @@ data:
         local_rank = train.get_context().get_local_rank()
         
         print(f"Worker {rank}/{world_size} starting (local_rank={local_rank})")
-        
+
+        # Initialize wandb on rank 0 only
+        if rank == 0 and os.environ.get("WANDB_API_KEY"):
+            wandb.init(
+                project=os.environ.get("WANDB_PROJECT", "llama3-function-calling"),
+                name=os.environ.get("WANDB_RUN_NAME", "ray-training"),
+                config={
+                    "model": MODEL_NAME,
+                    "lora_r": 64,
+                    "lora_alpha": 128,
+                    "world_size": world_size,
+                }
+            )
+
         # Load tokenizer
         tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
         tokenizer.pad_token = tokenizer.eos_token
@@ -154,7 +208,7 @@ data:
             gradient_checkpointing_kwargs={"use_reentrant": False},
             dataloader_num_workers=4,
             ddp_find_unused_parameters=False,
-            report_to="none",
+            report_to="wandb" if os.environ.get("WANDB_API_KEY") else "none",
         )
         
         # Create trainer
@@ -169,14 +223,27 @@ data:
             packing=False,
         )
         
-        # Train
-        trainer.train()
+        # Check for existing checkpoints to resume from
+        import glob
+        checkpoints = glob.glob(f"{OUTPUT_DIR}/checkpoint-*")
+        resume_checkpoint = None
+        if checkpoints:
+            # Find the latest checkpoint
+            latest = max(checkpoints, key=lambda x: int(x.split("-")[-1]))
+            resume_checkpoint = latest
+            if rank == 0:
+                print(f"Resuming from checkpoint: {resume_checkpoint}")
+        
+        # Train (with resume if checkpoint exists)
+        trainer.train(resume_from_checkpoint=resume_checkpoint)
         
         # Save final model (only on rank 0)
         if rank == 0:
             trainer.save_model(f"{OUTPUT_DIR}/final")
             print(f"Model saved to {OUTPUT_DIR}/final")
-        
+            if os.environ.get("WANDB_API_KEY"):
+                wandb.finish()
+
         return {"status": "completed", "rank": rank}
     
     if __name__ == "__main__":

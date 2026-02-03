@@ -7,7 +7,7 @@ ssh_public_key = {
 
 # K8s nodes
 cpu_nodes_count           = 2 # Number of CPU nodes
-gpu_nodes_count_per_group = 2 # Number of GPU nodes per group (temporarily 0 to switch fabric)
+gpu_nodes_count_per_group = 2 # Number of GPU nodes per group (temporarily 0 to pause)
 gpu_node_groups           = 1 # In case you need more then 100 nodes in cluster you have to put multiple node groups
 # CPU platform and presets: https://docs.nebius.com/compute/virtual-machines/types#cpu-configurations
 cpu_nodes_platform = "cpu-d3"     # CPU nodes platform

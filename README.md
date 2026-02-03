@@ -58,8 +58,20 @@ kubectl logs -f llama3-training-0
 ### 5. Evaluate Results
 
 ```bash
-kubectl apply -f k8s/inference-job.yaml
+# Run inference demo (auto-detects latest checkpoint)
+kubectl apply -f k8s/inference-test-job.yaml
+
+# Watch the demo output
+kubectl logs -n ray-cluster -f job/llama3-inference-demo
 ```
+
+The demo automatically finds the latest checkpoint (or `final` model if training completed) and runs 6 diverse test cases:
+- Side-by-side comparison of base model vs fine-tuned model
+- JSON validity checking and argument validation
+- Success rate metrics for both models
+- Improvement percentage from fine-tuning
+
+**Test categories:** Weather, Math, Database, Email, Scheduling, Currency
 
 ## Project Structure
 
@@ -68,11 +80,12 @@ kubectl apply -f k8s/inference-job.yaml
 │   ├── data/           # Data loading & preprocessing
 │   └── training/       # Distributed trainer & configs
 ├── scripts/
-│   ├── prepare_data.py # Download & process dataset
-│   ├── train.py        # Main training script
-│   ├── inference.py    # Test fine-tuned model
-│   ├── evaluate.py     # Measure accuracy
-│   └── benchmark.py    # GPU performance test
+│   ├── prepare_data.py   # Download & process dataset
+│   ├── train.py          # Main training script
+│   ├── inference_demo.py # Enhanced inference demo (base vs fine-tuned)
+│   ├── inference.py      # Simple inference test
+│   ├── evaluate.py       # Measure accuracy
+│   └── benchmark.py      # GPU performance test
 ├── configs/
 │   └── train_config.yaml
 ├── k8s/                # Kubernetes manifests
@@ -94,22 +107,43 @@ Key settings in `configs/train_config.yaml`:
 
 ## Monitoring
 
+### Training Metrics (Wandb - Recommended)
+
 ```bash
-# GPU metrics in Grafana
+# Deploy with wandb enabled
+export WANDB_API_KEY=$(kubectl get secret wandb-token -n default -o jsonpath='{.data.key}' | base64 -d)
+envsubst < k8s/ray-training-job.yaml | kubectl apply -f -
+
+# View dashboard at: https://wandb.ai/<your-username>/llama3-function-calling
+```
+
+### GPU Metrics (Grafana)
+
+```bash
 kubectl port-forward -n o11y svc/grafana-and-prometheus 8080:80
 # Open http://localhost:8080 (admin / see .env for password)
+```
 
-# Training logs (loss, accuracy)
+### Ray Dashboard (Job Management)
+
+```bash
+kubectl port-forward -n ray-cluster svc/ray-cluster-head-svc 8265:8265
+# Open http://localhost:8265
+```
+
+### Training Logs
+
+```bash
 kubectl logs llama3-training-0 | grep -E "loss.*epoch"
-
-# GPU utilization
 kubectl exec llama3-training-0 -- nvidia-smi
 ```
 
 ## Documentation
 
+- [PoC Summary](docs/PoC_Summary.md) - Executive overview & scaling guide
 - [Infrastructure Quick Start](docs/Infrastructure_Quick_Start.md)
 - [Training Guide](docs/Training_Guide.md)
+- [Monitoring Guide](docs/Monitoring_Guide.md)
 - [Technical Implementation Plan](docs/Technical_Implementation_Plan.md)
 
 ## License

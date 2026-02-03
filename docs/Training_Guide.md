@@ -238,15 +238,24 @@ CA 'mlx5_0'
 
 ### Step 2: Submit Ray Training Job
 
+**Without Wandb:**
 ```bash
-# Submit training job
 kubectl apply -f k8s/ray-training-job.yaml
+```
 
+**With Wandb (recommended):**
+```bash
+# Export wandb API key and apply with envsubst
+export WANDB_API_KEY=$(kubectl get secret wandb-token -n default -o jsonpath='{.data.key}' | base64 -d)
+envsubst < k8s/ray-training-job.yaml | kubectl apply -f -
+```
+
+```bash
 # Check job status
 kubectl get rayjob -n ray-cluster
 
 # Follow logs
-kubectl logs -n ray-cluster -l ray.io/job-name=llama3-finetuning -f
+kubectl logs -n ray-cluster -l job-name=llama3-finetuning -f
 ```
 
 ### Step 3: Monitor Training
@@ -401,10 +410,62 @@ kubectl apply -f k8s/training-fsdp.yaml
 
 ## Monitoring
 
+### Available Dashboards
+
+| Dashboard | What It Shows | Training Metrics Charts | URL |
+|-----------|---------------|------------------------|-----|
+| **Wandb** | Loss curves, LR schedule, grad norms | ✅ Yes (recommended) | https://wandb.ai |
+| **Ray Dashboard** | Job status, logs, cluster resources | ❌ No (logs only) | localhost:8265 |
+| **Grafana** | GPU metrics (temp, power, utilization) | ❌ No | localhost:8080 |
+| **TensorBoard** | Training metrics | ❌ Not enabled by default | - |
+
+### Weights & Biases (Recommended for Training Metrics)
+
+Wandb provides real-time training visualization when enabled:
+- **Loss curves** with smoothing
+- **Learning rate schedule**
+- **Gradient norms**
+- **Epoch progress**
+- **Run comparison** across experiments
+
+**Enable Wandb for KubeRay:**
+```bash
+export WANDB_API_KEY=$(kubectl get secret wandb-token -n default -o jsonpath='{.data.key}' | base64 -d)
+envsubst < k8s/ray-training-job.yaml | kubectl apply -f -
+```
+
+**View Dashboard:**
+```
+https://wandb.ai/<your-username>/llama3-function-calling
+```
+
+The RayJob includes wandb integration with:
+- `WANDB_PROJECT`: llama3-function-calling
+- `WANDB_RUN_NAME`: ray-h100-16x-lora
+- Automatic login via `WANDB_API_KEY`
+
+### Ray Dashboard (Job Management)
+
+```bash
+kubectl port-forward -n ray-cluster svc/ray-cluster-head-svc 8265:8265
+# Open http://localhost:8265
+```
+
+Shows:
+- Job status and logs
+- Worker status
+- Cluster resource usage
+- Job submission history
+
+**Note:** Ray Dashboard shows training metrics in logs but does not provide charts. Use Wandb for visualization.
+
 ### Training Logs
 
 ```bash
-# Follow logs from master node
+# KubeRay logs
+kubectl logs -n ray-cluster -l job-name=llama3-finetuning -f
+
+# StatefulSet logs
 kubectl logs -f llama3-training-0
 
 # Check specific rank logs
@@ -423,7 +484,7 @@ kubectl logs llama3-training-1 | grep "\[Rank 8\]"
 
 Example log output:
 ```json
-{'loss': '1.433', 'grad_norm': '2.876', 'learning_rate': '6.75e-06', 
+{'loss': '1.433', 'grad_norm': '2.876', 'learning_rate': '6.75e-06',
  'mean_token_accuracy': '0.7492', 'epoch': '0.02385'}
 ```
 
@@ -433,7 +494,10 @@ Example log output:
 # Single node
 kubectl exec llama3-training-0 -- nvidia-smi
 
-# All nodes
+# KubeRay GPU workers
+kubectl exec -n ray-cluster <gpu-worker-pod> -- nvidia-smi --query-gpu=index,utilization.gpu,memory.used,temperature.gpu,power.draw --format=csv
+
+# All StatefulSet nodes
 for pod in llama3-training-0 llama3-training-1; do
   echo "=== $pod ==="
   kubectl exec $pod -- nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv
@@ -442,7 +506,7 @@ done
 
 **Expected H100 utilization:** 70-100% GPU, 20-80GB memory per GPU
 
-### Grafana Dashboard
+### Grafana Dashboard (GPU & System Metrics)
 
 ```bash
 kubectl port-forward -n o11y svc/grafana-and-prometheus 8080:80
@@ -450,13 +514,30 @@ kubectl port-forward -n o11y svc/grafana-and-prometheus 8080:80
 # Login: admin / (see your .env for password)
 ```
 
-### Weights & Biases
+Shows:
+- NVIDIA DCGM metrics (GPU temperature, power, utilization)
+- Node system metrics
+- Loki logs
 
-Training metrics are automatically logged to W&B if configured:
-- Loss curves
-- Learning rate schedule
-- GPU memory usage
-- Gradient norms
+**Note:** Grafana shows infrastructure metrics, not training metrics. Use Wandb for loss/accuracy curves.
+
+### TensorBoard (Optional)
+
+TensorBoard is **not enabled by default**. To enable it, modify the training script:
+
+```python
+# In TrainingArguments
+report_to=["wandb", "tensorboard"],  # Add tensorboard
+logging_dir="/mnt/data/tensorboard_logs",
+```
+
+Then access via:
+```bash
+kubectl port-forward <training-pod> 6006:6006
+# Open http://localhost:6006
+```
+
+> **For detailed monitoring instructions, troubleshooting, and alerting setup, see the [Monitoring Guide](Monitoring_Guide.md).**
 
 ## Debugging
 
@@ -981,4 +1062,60 @@ Before scaling to 512 GPUs:
 
 ---
 
-*Last updated: 2026-02-02*
+## Evaluate Results
+
+After training completes, run the inference demo to evaluate the fine-tuned model:
+
+### Run Inference Demo
+
+```bash
+# Deploy the inference demo job
+kubectl apply -f k8s/inference-test-job.yaml
+
+# Watch the demo output
+kubectl logs -n ray-cluster -f job/llama3-inference-demo
+```
+
+### What the Demo Shows
+
+The demo compares the **base Llama-3-8B-Instruct** vs the **fine-tuned model** on function calling tasks:
+
+| Test Category | Example Query |
+|--------------|---------------|
+| API Calls | "What's the weather in San Francisco?" |
+| Computation | "What is 15% of 850?" |
+| Data Operations | "Find all customers from New York" |
+| Communication | "Send an email to john@example.com" |
+| Scheduling | "Schedule a 30-minute standup tomorrow" |
+| Financial | "Convert 500 USD to Japanese yen" |
+
+### Evaluation Metrics
+
+For each test case, the demo evaluates:
+- **JSON Validity** - Does the response contain valid JSON?
+- **Function Name** - Is the correct function being called?
+- **Arguments** - Are all required arguments present?
+
+### Expected Output
+
+```
+═══════════════════════════════════════════════════════════════════════
+                      EVALUATION SUMMARY
+═══════════════════════════════════════════════════════════════════════
+
+Fine-tuned Model:
+  ✓ Passed: 6/6
+  Success Rate: 100.0%
+
+Base Model:
+  ✓ Passed: 2/6
+  Success Rate: 33.3%
+
+═══════════════════════════════════════════════════════════════════════
+  IMPROVEMENT FROM FINE-TUNING: +66.7%
+═══════════════════════════════════════════════════════════════════════
+```
+
+---
+
+*Last updated: 2026-02-03*

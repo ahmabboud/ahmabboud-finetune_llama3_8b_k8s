@@ -1,0 +1,511 @@
+###############################################################################
+# Inference Demo Job - Llama-3 Function Calling
+#
+# Demonstrates the fine-tuned model's ability to generate proper function calls.
+# Compares base model vs fine-tuned model to show improvement.
+#
+# FEATURES:
+#   - Side-by-side base vs fine-tuned comparison
+#   - 8 diverse business-relevant test cases
+#   - JSON validity checking and argument validation
+#   - Success rate metrics and summary
+#
+# Usage:
+#   # Run with auto-detected latest checkpoint (default behavior)
+#   kubectl apply -f k8s/inference-test-job.yaml
+#
+#   # Auto-detection priority:
+#   #   1. If CHECKPOINT_NAME env var is set, use that
+#   #   2. If "final" model exists, use it (training completed)
+#   #   3. Otherwise, find latest checkpoint-N (sorted by step number)
+#
+#   # Run with specific checkpoint (override auto-detection)
+#   export CHECKPOINT_NAME=checkpoint-600
+#   envsubst < k8s/inference-test-job.yaml | kubectl apply -f -
+#
+#   # Watch logs
+#   kubectl logs -n ray-cluster -f job/llama3-inference-demo
+#
+# Prerequisites:
+#   - Checkpoint available: /mnt/data/checkpoints/llama3-function-calling-ray/<checkpoint>
+#   - Base model available: /mnt/data/models/Meta-Llama-3-8B-Instruct
+###############################################################################
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: llama3-inference-demo
+  namespace: ray-cluster
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: inference-demo
+        image: nvcr.io/nvidia/pytorch:24.01-py3
+        command: ["bash", "-c"]
+        args:
+        - |
+          set -e
+          echo "=========================================="
+          echo "Installing dependencies..."
+          echo "=========================================="
+          pip install -q transformers peft accelerate bitsandbytes
+
+          echo ""
+          echo "=========================================="
+          echo "Running Inference Demo..."
+          echo "=========================================="
+          python /scripts/inference_demo.py
+
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+            memory: "64Gi"
+          requests:
+            nvidia.com/gpu: 1
+            memory: "48Gi"
+            cpu: "8"
+        volumeMounts:
+        - name: shared-data
+          mountPath: /mnt/data
+        - name: demo-script
+          mountPath: /scripts
+        env:
+        - name: HF_HOME
+          value: "/mnt/data/cache/huggingface"
+        - name: TRANSFORMERS_CACHE
+          value: "/mnt/data/cache/huggingface"
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: "expandable_segments:True"
+        # Optional: Specify checkpoint name to override auto-detection
+        # Auto-detection: final > latest checkpoint-N
+        - name: CHECKPOINT_NAME
+          value: "${CHECKPOINT_NAME}"
+      volumes:
+      - name: shared-data
+        hostPath:
+          path: /mnt/data
+          type: Directory
+      - name: demo-script
+        configMap:
+          name: inference-demo-script
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "NoSchedule"
+      nodeSelector:
+        nvidia.com/gpu.product: "NVIDIA-H100-80GB-HBM3"
+
+---
+# ConfigMap containing the demo script
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: inference-demo-script
+  namespace: ray-cluster
+data:
+  inference_demo.py: |
+    #!/usr/bin/env python3
+    """
+    Enhanced Inference Demo for Llama-3 Function Calling Fine-tuning
+
+    This demo compares the base model vs fine-tuned model on function calling tasks,
+    demonstrating the improvement achieved through LoRA fine-tuning.
+    """
+
+    import torch
+    import json
+    import re
+    import sys
+    from typing import Dict, List, Tuple, Optional
+    from dataclasses import dataclass
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from peft import PeftModel
+
+    # Configuration - checkpoint can be overridden via CHECKPOINT_NAME env var
+    BASE_MODEL_PATH = "/mnt/data/models/llama3-8b-instruct"
+    CHECKPOINT_DIR = "/mnt/data/checkpoints/llama3-function-calling-ray"
+
+    # Auto-detect latest checkpoint or use env var
+    def get_checkpoint_path():
+        import glob
+        import re
+
+        # If explicit checkpoint specified, use it
+        if os.environ.get("CHECKPOINT_NAME"):
+            return f"{CHECKPOINT_DIR}/{os.environ.get('CHECKPOINT_NAME')}"
+
+        # Check if final model exists (training completed)
+        final_path = f"{CHECKPOINT_DIR}/final"
+        if os.path.exists(final_path):
+            print(f"Using final model: {final_path}")
+            return final_path
+
+        # Find latest checkpoint-N directory
+        checkpoints = glob.glob(f"{CHECKPOINT_DIR}/checkpoint-*")
+        if checkpoints:
+            # Extract step numbers and sort
+            checkpoint_steps = []
+            for ckpt in checkpoints:
+                match = re.search(r'checkpoint-(\d+)', ckpt)
+                if match:
+                    checkpoint_steps.append((int(match.group(1)), ckpt))
+
+            if checkpoint_steps:
+                # Sort by step number and get the latest
+                latest = sorted(checkpoint_steps, key=lambda x: x[0])[-1]
+                print(f"Auto-detected latest checkpoint: {latest[1]} (step {latest[0]})")
+                return latest[1]
+
+        raise ValueError(f"No checkpoints found in {CHECKPOINT_DIR}")
+
+    LORA_ADAPTER_PATH = get_checkpoint_path()
+
+    # ANSI colors for terminal output
+    class Colors:
+        HEADER = '\033[95m'
+        BLUE = '\033[94m'
+        CYAN = '\033[96m'
+        GREEN = '\033[92m'
+        YELLOW = '\033[93m'
+        RED = '\033[91m'
+        BOLD = '\033[1m'
+        END = '\033[0m'
+
+    def print_header(text: str, char: str = "="):
+        width = 70
+        print(f"\n{Colors.BOLD}{Colors.CYAN}{char * width}")
+        print(f"{text.center(width)}")
+        print(f"{char * width}{Colors.END}\n")
+
+    def print_subheader(text: str):
+        print(f"\n{Colors.BOLD}{Colors.YELLOW}{'─' * 70}")
+        print(f"  {text}")
+        print(f"{'─' * 70}{Colors.END}")
+
+    def print_success(text: str):
+        print(f"{Colors.GREEN}✓ {text}{Colors.END}")
+
+    def print_warning(text: str):
+        print(f"{Colors.YELLOW}⚠ {text}{Colors.END}")
+
+    def print_error(text: str):
+        print(f"{Colors.RED}✗ {text}{Colors.END}")
+
+    @dataclass
+    class TestCase:
+        name: str
+        category: str
+        system_prompt: str
+        user_query: str
+        expected_function: str
+        expected_args: List[str]
+
+    # Test cases covering various function calling scenarios
+    TEST_CASES = [
+        TestCase(
+            name="Weather Query",
+            category="API Calls",
+            system_prompt="""You are a helpful assistant with access to the following functions. Use them if required -
+    {
+        "name": "get_weather",
+        "description": "Get the current weather for a location",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "location": {"type": "string", "description": "The city name"},
+                "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+            },
+            "required": ["location"]
+        }
+    }""",
+            user_query="What's the weather like in San Francisco?",
+            expected_function="get_weather",
+            expected_args=["location"]
+        ),
+        TestCase(
+            name="Mathematical Calculation",
+            category="Computation",
+            system_prompt="""You are a helpful assistant with access to the following functions. Use them if required -
+    {
+        "name": "calculate",
+        "description": "Evaluate a mathematical expression",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "expression": {"type": "string", "description": "The expression to evaluate"}
+            },
+            "required": ["expression"]
+        }
+    }""",
+            user_query="What is 15% of 850?",
+            expected_function="calculate",
+            expected_args=["expression"]
+        ),
+        TestCase(
+            name="Database Search",
+            category="Data Operations",
+            system_prompt="""You are a helpful assistant with access to the following functions. Use them if required -
+    {
+        "name": "search_database",
+        "description": "Search the customer database",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "table": {"type": "string"},
+                "limit": {"type": "integer"}
+            },
+            "required": ["query", "table"]
+        }
+    }""",
+            user_query="Find all customers from New York in the users table",
+            expected_function="search_database",
+            expected_args=["query", "table"]
+        ),
+        TestCase(
+            name="Send Email",
+            category="Communication",
+            system_prompt="""You are a helpful assistant with access to the following functions. Use them if required -
+    {
+        "name": "send_email",
+        "description": "Send an email to a recipient",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string"},
+                "subject": {"type": "string"},
+                "body": {"type": "string"}
+            },
+            "required": ["to", "subject", "body"]
+        }
+    }""",
+            user_query="Send an email to john@example.com with subject 'Meeting Tomorrow' saying we need to discuss Q4",
+            expected_function="send_email",
+            expected_args=["to", "subject", "body"]
+        ),
+        TestCase(
+            name="Schedule Meeting",
+            category="Scheduling",
+            system_prompt="""You are a helpful assistant with access to the following functions. Use them if required -
+    {
+        "name": "create_calendar_event",
+        "description": "Create a calendar event",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "start_time": {"type": "string"},
+                "duration_minutes": {"type": "integer"}
+            },
+            "required": ["title", "start_time", "duration_minutes"]
+        }
+    }""",
+            user_query="Schedule a 30-minute team standup tomorrow at 9 AM",
+            expected_function="create_calendar_event",
+            expected_args=["title", "start_time", "duration_minutes"]
+        ),
+        TestCase(
+            name="Currency Conversion",
+            category="Financial",
+            system_prompt="""You are a helpful assistant with access to the following functions. Use them if required -
+    {
+        "name": "convert_currency",
+        "description": "Convert between currencies",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "amount": {"type": "number"},
+                "from_currency": {"type": "string"},
+                "to_currency": {"type": "string"}
+            },
+            "required": ["amount", "from_currency", "to_currency"]
+        }
+    }""",
+            user_query="Convert 500 US dollars to Japanese yen",
+            expected_function="convert_currency",
+            expected_args=["amount", "from_currency", "to_currency"]
+        ),
+    ]
+
+    def extract_json_from_response(response: str) -> Optional[Dict]:
+        patterns = [
+            r'\{[^{}]*"name"[^{}]*\}',
+            r'\{[^{}]*"function"[^{}]*\}',
+            r'```json\s*(.*?)\s*```',
+            r'```\s*(.*?)\s*```',
+        ]
+        for pattern in patterns:
+            matches = re.findall(pattern, response, re.DOTALL)
+            for match in matches:
+                try:
+                    json_str = match.strip()
+                    if not json_str.startswith('{'):
+                        json_str = '{' + json_str + '}'
+                    return json.loads(json_str)
+                except json.JSONDecodeError:
+                    continue
+        try:
+            return json.loads(response.strip())
+        except json.JSONDecodeError:
+            pass
+        return None
+
+    def evaluate_response(response: str, test_case: TestCase) -> Tuple[bool, str, Optional[Dict]]:
+        parsed = extract_json_from_response(response)
+        if parsed is None:
+            return False, "No valid JSON found", None
+        func_name = parsed.get("name") or parsed.get("function")
+        if not func_name:
+            return False, "Missing function name", parsed
+        if func_name != test_case.expected_function:
+            return False, f"Wrong function: {func_name}", parsed
+        args = parsed.get("arguments") or parsed.get("parameters") or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except:
+                return False, "Invalid arguments", parsed
+        missing = [a for a in test_case.expected_args if a not in args]
+        if missing:
+            return False, f"Missing args: {missing}", parsed
+        return True, "Valid function call", parsed
+
+    class ModelTester:
+        def __init__(self):
+            self.tokenizer = None
+            self.base_model = None
+            self.finetuned_model = None
+
+        def load_tokenizer(self):
+            print("Loading tokenizer...")
+            self.tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_PATH)
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            print_success("Tokenizer loaded")
+
+        def load_base_model(self):
+            print("\nLoading base model (4-bit quantized)...")
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            )
+            self.base_model = AutoModelForCausalLM.from_pretrained(
+                BASE_MODEL_PATH,
+                quantization_config=bnb_config,
+                device_map="auto",
+                torch_dtype=torch.bfloat16,
+            )
+            self.base_model.eval()
+            print_success("Base model loaded")
+
+        def load_finetuned_model(self):
+            print("\nLoading fine-tuned model with LoRA adapter...")
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            )
+            base = AutoModelForCausalLM.from_pretrained(
+                BASE_MODEL_PATH,
+                quantization_config=bnb_config,
+                device_map="auto",
+                torch_dtype=torch.bfloat16,
+            )
+            self.finetuned_model = PeftModel.from_pretrained(base, LORA_ADAPTER_PATH)
+            self.finetuned_model.eval()
+            print_success("Fine-tuned model loaded")
+
+        def generate(self, model, system_prompt: str, user_query: str) -> str:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_query}
+            ]
+            prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            inputs = self.tokenizer(prompt, return_tensors="pt").to(model.device)
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=256,
+                    temperature=0.1,
+                    do_sample=True,
+                    top_p=0.9,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                )
+            return self.tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True).strip()
+
+    def main():
+        print_header("LLAMA-3 FUNCTION CALLING FINE-TUNING DEMO")
+
+        print(f"{Colors.BOLD}Configuration:{Colors.END}")
+        print(f"  Base Model: {BASE_MODEL_PATH}")
+        print(f"  LoRA Adapter: {LORA_ADAPTER_PATH}")
+
+        tester = ModelTester()
+
+        print_header("LOADING MODELS")
+        tester.load_tokenizer()
+        tester.load_finetuned_model()
+        tester.load_base_model()
+
+        print_header("RUNNING FUNCTION CALLING TESTS")
+
+        results = {"base": {"passed": 0, "failed": 0}, "finetuned": {"passed": 0, "failed": 0}}
+
+        for i, test in enumerate(TEST_CASES, 1):
+            print_subheader(f"Test {i}/{len(TEST_CASES)}: {test.name} ({test.category})")
+
+            print(f"\n{Colors.BOLD}User Query:{Colors.END} \"{test.user_query}\"")
+            print(f"{Colors.BOLD}Expected:{Colors.END} {test.expected_function}({', '.join(test.expected_args)})")
+
+            # Fine-tuned model
+            print(f"\n{Colors.BOLD}{Colors.GREEN}Fine-tuned Model:{Colors.END}")
+            ft_response = tester.generate(tester.finetuned_model, test.system_prompt, test.user_query)
+            print(f"  {ft_response[:150]}{'...' if len(ft_response) > 150 else ''}")
+            ft_valid, ft_msg, _ = evaluate_response(ft_response, test)
+            if ft_valid:
+                print_success(f"  {ft_msg}")
+                results["finetuned"]["passed"] += 1
+            else:
+                print_error(f"  {ft_msg}")
+                results["finetuned"]["failed"] += 1
+
+            # Base model
+            print(f"\n{Colors.BOLD}{Colors.BLUE}Base Model:{Colors.END}")
+            base_response = tester.generate(tester.base_model, test.system_prompt, test.user_query)
+            print(f"  {base_response[:150]}{'...' if len(base_response) > 150 else ''}")
+            base_valid, base_msg, _ = evaluate_response(base_response, test)
+            if base_valid:
+                print_success(f"  {base_msg}")
+                results["base"]["passed"] += 1
+            else:
+                print_warning(f"  {base_msg}")
+                results["base"]["failed"] += 1
+
+        # Summary
+        print_header("EVALUATION SUMMARY", "═")
+
+        total = len(TEST_CASES)
+        ft_rate = results["finetuned"]["passed"] / total * 100
+        base_rate = results["base"]["passed"] / total * 100
+        improvement = ft_rate - base_rate
+
+        print(f"{Colors.BOLD}Fine-tuned Model:{Colors.END}")
+        print(f"  ✓ Passed: {results['finetuned']['passed']}/{total}")
+        print(f"  {Colors.GREEN}Success Rate: {ft_rate:.1f}%{Colors.END}")
+
+        print(f"\n{Colors.BOLD}Base Model:{Colors.END}")
+        print(f"  ✓ Passed: {results['base']['passed']}/{total}")
+        print(f"  Success Rate: {base_rate:.1f}%")
+
+        print(f"\n{Colors.BOLD}{Colors.CYAN}═══════════════════════════════════════════════════════════════════════{Colors.END}")
+        print(f"{Colors.BOLD}{Colors.CYAN}  IMPROVEMENT FROM FINE-TUNING: +{improvement:.1f}%{Colors.END}")
+        print(f"{Colors.BOLD}{Colors.CYAN}═══════════════════════════════════════════════════════════════════════{Colors.END}")
+
+        print_header("DEMO COMPLETE")
+        return 0 if ft_rate >= 70 else 1
+
+    if __name__ == "__main__":
+        sys.exit(main())
