@@ -9,25 +9,9 @@ This project demonstrates efficient multi-node LLM fine-tuning using:
 - **PyTorch FSDP** for distributed training
 - **LoRA (PEFT)** for parameter-efficient fine-tuning (2% trainable params)
 - **TRL SFTTrainer** for supervised fine-tuning
-- **KubeRay** for distributed training orchestration
-- **Kubeflow Pipelines** for automated ML workflows (optional)
+- **Kubernetes StatefulSet** for orchestration
 
 ## Quick Start
-
-### Two Approaches
-
-**Option A: Manual Workflow** (Great for learning, experimentation)
-- Run each stage manually with `kubectl apply`
-- Full control over each step
-- Recommended for initial setup and testing
-
-**Option B: Automated Pipeline** (Great for production, repeatability)
-- Use Kubeflow Pipelines to automate all stages
-- One command to run entire workflow
-- Automatic retry, monitoring, and conditional deployment
-- See [Kubeflow Setup Guide](docs/Kubeflow_Setup_Guide.md)
-
----
 
 ### 1. Infrastructure Setup
 
@@ -59,44 +43,17 @@ kubectl apply -f k8s/data-prep-job.yaml
 
 ### 4. Run Training
 
-#### Option A: Manual (Step-by-step)
-
 ```bash
 # Run smoke test first (recommended)
 kubectl apply -f k8s/smoke-test-job.yaml
 kubectl logs -f job/training-smoke-test
 
-# Deploy Ray training (2 nodes, 16 GPUs)
-export WANDB_API_KEY=$(kubectl get secret wandb-token -n default -o jsonpath='{.data.key}' | base64 -d)
-envsubst < k8s/ray-training-job.yaml | kubectl apply -f -
+# Deploy FSDP training (2 nodes, 16 GPUs)
+kubectl apply -f k8s/training-fsdp.yaml
 
 # Monitor
-kubectl logs -n ray-cluster -l job-name=llama3-finetuning -f
+kubectl logs -f llama3-training-0
 ```
-
-#### Option B: Automated Pipeline (Kubeflow)
-
-```bash
-# Install Kubeflow Pipelines (one-time)
-./scripts/install_kubeflow_pipelines.sh
-
-# Port-forward to access UI
-kubectl port-forward -n kubeflow svc/ml-pipeline-ui 8080:80
-# Open http://localhost:8080
-
-# Submit pipeline (runs all stages automatically)
-pip install kfp==2.5.0
-python pipelines/llama3_training_pipeline.py --submit
-
-# Pipeline automatically:
-# 1. Prepares data
-# 2. Trains model (90 min)
-# 3. Evaluates results
-# 4. Deploys if accuracy > 70%
-# 5. Sends notification
-```
-
-See [Kubeflow Setup Guide](docs/Kubeflow_Setup_Guide.md) for details.
 
 ### 5. Evaluate Results
 
@@ -128,9 +85,7 @@ The demo automatically finds the latest checkpoint (or `final` model if training
 │   ├── inference_demo.py # Enhanced inference demo (base vs fine-tuned)
 │   ├── inference.py      # Simple inference test
 │   ├── evaluate.py       # Measure accuracy
-│   └── install_kubeflow_pipelines.sh  # KFP installation
-├── pipelines/
-│   └── llama3_training_pipeline.py   # Automated ML pipeline (KFP)
+│   └── benchmark.py      # GPU performance test
 ├── configs/
 │   └── train_config.yaml
 ├── k8s/                # Kubernetes manifests
@@ -185,28 +140,11 @@ kubectl exec llama3-training-0 -- nvidia-smi
 
 ## Documentation
 
-### Getting Started
 - [PoC Summary](docs/PoC_Summary.md) - Executive overview & scaling guide
-- [Infrastructure Quick Start](docs/Infrastructure_Quick_Start.md) - Cluster setup
-
-### Training
-- [Training Guide](docs/Training_Guide.md) - Manual training workflows
-- **[Kubeflow Setup Guide](docs/Kubeflow_Setup_Guide.md) - Automated pipelines** ⭐ NEW
-
-### Operations
-- [Monitoring Guide](docs/Monitoring_Guide.md) - Observability & debugging
-- [Technical Implementation Plan](docs/Technical_Implementation_Plan.md) - Architecture
-
-## Comparison: Manual vs Automated
-
-| Feature | Manual Workflow | Kubeflow Pipeline |
-|---------|----------------|-------------------|
-| **Setup** | Run `kubectl apply` for each stage | Install KFP once, then submit pipeline |
-| **Execution** | Wait & monitor each step | Runs automatically end-to-end |
-| **Retry** | Manual restart if failed | Automatic retry on failure |
-| **Conditional Logic** | Check results, decide manually | Auto-deploy if accuracy > 70% |
-| **Tracking** | Check logs manually | Visual DAG + artifact tracking |
-| **Best For** | Learning, debugging, one-off runs | Production, repeatability, automation |
+- [Infrastructure Quick Start](docs/Infrastructure_Quick_Start.md)
+- [Training Guide](docs/Training_Guide.md)
+- [Monitoring Guide](docs/Monitoring_Guide.md)
+- [Technical Implementation Plan](docs/Technical_Implementation_Plan.md)
 
 ## License
 
