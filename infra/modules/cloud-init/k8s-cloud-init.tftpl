@@ -1,6 +1,3 @@
-package_update: true
-package_upgrade: true
-
 %{ if enable_filestore != "false" }
 mounts:
 - [ data, /mnt/data, virtiofs, "defaults", 0, 2 ]
