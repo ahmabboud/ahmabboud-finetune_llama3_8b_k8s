@@ -358,26 +358,26 @@ Pre-configured alerts available for:
 
 ### 5.1 What Changes
 
-| Component | 16 GPUs | 512 GPUs | Change Required |
-|-----------|---------|----------|-----------------|
-| `gpu_nodes_count` | 2 | 64 | Terraform variable |
-| `num_workers` | 16 | 512 | RayJob YAML |
-| `filestore_size` | 2 TB | 32 TB | Terraform variable |
-| Learning rate | 1.5e-4 | 4.5e-4 | Training config |
-| Grad accumulation | 4 | 1 | Training config |
+| Component | 16 GPUs (PoC) | 512 GPUs | File |
+|-----------|---------------|----------|------|
+| `gpu_max_nodes` | 2 | 64 | terraform.tfvars |
+| `gpu_nodes_count_per_group` | 2 | 64 | terraform.tfvars |
+| `num_workers` | 16 | 512 | ray-training-job.yaml |
+| `learning_rate` | 1.5e-4 | 5e-4 | ray-training-job.yaml |
+| `gradient_accumulation_steps` | 4 | 1 | ray-training-job.yaml |
 
 ### 5.2 Scaling Commands
 
 **Step 1: Update Terraform**
 ```hcl
-# terraform.tfvars
-gpu_nodes_count_per_group = 64   # Was: 2
-filestore_disk_size = 32TB       # Was: 2TB
-kuberay_max_gpu_replicas = 64    # Was: 2
+# infra/k8s-installation/terraform.tfvars
+gpu_max_nodes             = 64
+gpu_nodes_count_per_group = 64
 ```
 
 **Step 2: Apply Infrastructure**
 ```bash
+cd infra/k8s-installation
 terraform apply  # ~45-60 min for 64 nodes
 ```
 
@@ -385,27 +385,26 @@ terraform apply  # ~45-60 min for 64 nodes
 ```python
 # k8s/ray-training-job.yaml
 scaling_config=ScalingConfig(
-    num_workers=512,  # Was: 16
+    num_workers=512,
     ...
 )
-```
 
-**Step 4: Adjust Hyperparameters**
-```python
-learning_rate=4.5e-4,           # Scale √(512/16) ≈ 5.6×
-gradient_accumulation_steps=1,   # Reduce (batch already large)
+# Hyperparameters
+learning_rate=5e-4,
+gradient_accumulation_steps=1,
+# New effective batch: 4 × 1 × 512 = 2048
 ```
 
 ### 5.3 Scaling Performance
 
-| GPUs | Effective Batch | Est. Time (3 epochs) | Throughput |
-|------|-----------------|----------------------|------------|
-| 16 | 256 | ~90 min | 1x |
-| 64 | 1024 | ~25 min | 3.6x |
-| 256 | 4096 | ~8 min | 11x |
-| 512 | 8192 | ~4 min | 22x |
+| GPUs | Nodes | Effective Batch | Est. Time (3 epochs) | Relative Speed |
+|------|-------|-----------------|----------------------|----------------|
+| 16 | 2 | 256 | ~90 min | 1× |
+| 64 | 8 | 1024 | ~25 min | 3.6× |
+| 256 | 32 | 4096 | ~8 min | 11× |
+| 512 | 64 | 8192 | ~5 min | 18× |
 
-*Near-linear scaling due to efficient InfiniBand communication*
+*Note: Sub-linear scaling at 512 GPUs due to increased communication overhead. Near-linear up to ~256 GPUs with InfiniBand.*
 
 ---
 
@@ -508,59 +507,7 @@ kubectl logs -n ray-cluster -f job/llama3-inference-demo
 
 ---
 
-## 8. Next Steps for Client
-
-### 8.1 Immediate (PoC Phase)
-
-1. ✅ Clone repository
-2. ✅ Run `terraform apply`
-3. ✅ Execute training pipeline
-4. ✅ View results in Wandb
-
-### 8.2 Short-term (Production Setup)
-
-1. Scale to 64 GPUs for regular training
-2. Set up CI/CD for model deployment
-3. Configure alerting for production
-4. Implement model versioning
-
-### 8.3 Long-term (512 GPU Reservation)
-
-1. Scale infrastructure to 64 nodes
-2. Optimize for larger models (70B+)
-3. Implement distributed checkpointing
-4. Set up multi-tenant training queues
-
----
-
-## 9. Repository Structure
-
-```
-ahmabboud-finetune_llama3_8b_k8s/
-├── infra/                        # Terraform infrastructure
-│   └── k8s-installation/         # Main cluster config
-├── k8s/                          # Kubernetes manifests
-│   ├── ray-training-job.yaml     # Main training RayJob
-│   ├── model-download-job.yaml   # Model download job
-│   ├── data-prep-job.yaml        # Data preparation job
-│   ├── preflight-check.yaml      # GPU/NCCL validation
-│   └── inference-test-job.yaml   # Inference comparison
-├── scripts/                      # Runner scripts
-│   ├── run-model-download.sh
-│   ├── run-preflight-check.sh
-│   ├── run-data-prep.sh
-│   ├── submit-training-job.sh
-│   └── run-inference-test.sh
-└── docs/                         # Documentation
-    ├── Training_Guide.md
-    ├── Monitoring_Guide.md
-    ├── Infrastructure_Quick_Start.md
-    └── PoC_Summary.md
-```
-
----
-
-## 10. Summary
+# Summary
 
 This PoC demonstrates a **production-ready, scalable fine-tuning pipeline** that:
 
@@ -573,48 +520,3 @@ This PoC demonstrates a **production-ready, scalable fine-tuning pipeline** that
 The pipeline is designed for **small teams** who want to focus on ML, not infrastructure.
 
 ---
-
-## Appendix: Quick Reference
-
-### Run Full Pipeline
-```bash
-./scripts/run-model-download.sh     # Download Llama-3-8B
-./scripts/run-preflight-check.sh    # Validate cluster
-./scripts/run-data-prep.sh          # Prepare dataset
-./scripts/submit-training-job.sh    # Start training
-./scripts/run-inference-test.sh     # Test results
-```
-
-### Check Status
-```bash
-kubectl get rayjob -n ray-cluster
-kubectl logs -n ray-cluster -l job-name=llama3-finetuning --tail=50
-```
-
-### Access Dashboards
-```bash
-# Wandb
-open https://wandb.ai/<user>/llama3-function-calling
-
-# Ray Dashboard
-kubectl port-forward -n ray-cluster svc/ray-cluster-kuberay-head-svc 8265:8265
-
-# Grafana
-kubectl port-forward -n o11y svc/grafana-and-prometheus 8080:80
-```
-
-### Scale to 512 GPUs
-```bash
-# Edit terraform.tfvars
-gpu_nodes_count_per_group = 64
-
-# Apply
-terraform apply
-
-# Update training job num_workers to 512
-```
-
----
-
-*Document prepared for Nebius Cloud PoC Demo*
-*Last updated: 2026-02-05*
