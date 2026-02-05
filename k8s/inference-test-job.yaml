@@ -51,7 +51,8 @@ spec:
           echo "=========================================="
           echo "Installing dependencies..."
           echo "=========================================="
-          pip install -q transformers peft accelerate bitsandbytes
+          pip install -q 'huggingface-hub<1.0' safetensors 'tokenizers>=0.14,<0.19'
+          pip install -q --no-deps transformers==4.38.2 peft==0.13.2 accelerate==0.27.2 bitsandbytes==0.43.0
 
           echo ""
           echo "=========================================="
@@ -81,8 +82,8 @@ spec:
           value: "expandable_segments:True"
         # Optional: Specify checkpoint name to override auto-detection
         # Auto-detection: final > latest checkpoint-N
-        - name: CHECKPOINT_NAME
-          value: "${CHECKPOINT_NAME}"
+        # - name: CHECKPOINT_NAME
+        #   value: ""
       volumes:
       - name: shared-data
         hostPath:
@@ -115,6 +116,7 @@ data:
     demonstrating the improvement achieved through LoRA fine-tuning.
     """
 
+    import os
     import torch
     import json
     import re
@@ -331,6 +333,40 @@ data:
     ]
 
     def extract_json_from_response(response: str) -> Optional[Dict]:
+        """Extract function call JSON from model response, handling multiple formats."""
+        
+        # Format 1: <functioncall> {...} format (Glaive training format)
+        # The model outputs: <functioncall> {"name": "...", "arguments": '{...}'} 
+        # where arguments is a JSON string with single quotes wrapping it
+        if '<functioncall>' in response:
+            # Extract function name
+            name_match = re.search(r'"name":\s*"([^"]+)"', response)
+            if name_match:
+                func_name = name_match.group(1)
+                
+                # Extract arguments - look for 'arguments': followed by a JSON object in single quotes
+                # Pattern handles both single-line and multi-line JSON
+                args_match = re.search(r'"arguments":\s*\'(\{.*?\})\'', response, re.DOTALL)
+                if not args_match:
+                    # Try without quotes (direct JSON)
+                    args_match = re.search(r'"arguments":\s*(\{[^}]+\})', response, re.DOTALL)
+                
+                args = {}
+                if args_match:
+                    args_str = args_match.group(1)
+                    try:
+                        args = json.loads(args_str)
+                    except json.JSONDecodeError:
+                        # Try cleaning up the string
+                        args_str_clean = args_str.replace('\n', ' ').strip()
+                        try:
+                            args = json.loads(args_str_clean)
+                        except:
+                            pass
+                
+                return {"name": func_name, "arguments": args}
+        
+        # Format 2: Standard JSON patterns
         patterns = [
             r'\{[^{}]*"name"[^{}]*\}',
             r'\{[^{}]*"function"[^{}]*\}',

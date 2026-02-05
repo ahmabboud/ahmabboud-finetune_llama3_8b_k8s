@@ -101,7 +101,15 @@ resource "nebius_mk8s_v1_node_group" "cpu-only" {
 #################
 resource "nebius_mk8s_v1_node_group" "gpu" {
   count            = var.gpu_node_groups
-  fixed_node_count = var.gpu_nodes_count_per_group
+  
+  # Use either fixed count or autoscaling (mutually exclusive)
+  fixed_node_count = var.gpu_autoscaling_enabled ? null : var.gpu_nodes_count_per_group
+  
+  autoscaling = var.gpu_autoscaling_enabled ? {
+    min_node_count = var.gpu_min_nodes
+    max_node_count = var.gpu_max_nodes
+  } : null
+  
   parent_id        = nebius_mk8s_v1_cluster.k8s-cluster.id
   name             = join("-", ["k8s-ng-gpu", local.release-suffix, count.index])
   labels = {

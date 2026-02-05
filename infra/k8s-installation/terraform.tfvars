@@ -7,8 +7,13 @@ ssh_public_key = {
 
 # K8s nodes
 cpu_nodes_count           = 2 # Number of CPU nodes
-gpu_nodes_count_per_group = 2 # Number of GPU nodes per group (temporarily 0 to pause)
-gpu_node_groups           = 1 # In case you need more then 100 nodes in cluster you have to put multiple node groups
+
+# GPU nodes - autoscaling configuration (allows scale to zero)
+gpu_autoscaling_enabled   = true  # Enable autoscaling (scale to zero when idle)
+gpu_min_nodes             = 0     # Minimum nodes (0 = scale to zero)
+gpu_max_nodes             = 2     # Maximum nodes when needed
+gpu_nodes_count_per_group = 2     # Only used if gpu_autoscaling_enabled=false
+gpu_node_groups           = 1     # In case you need more then 100 nodes in cluster you have to put multiple node groups
 # CPU platform and presets: https://docs.nebius.com/compute/virtual-machines/types#cpu-configurations
 cpu_nodes_platform = "cpu-d3"     # CPU nodes platform
 cpu_nodes_preset   = "4vcpu-16gb" # CPU nodes preset
@@ -55,7 +60,7 @@ kuberay_max_cpu_replicas = 2
 
 #kuberay GPU worker pod setup
 kuberay_gpu_worker_image = "cr.eu-north1.nebius.cloud/e00tnz9wpyxva2s992/ray-gpu-infiniband:2.46.0-py310"
-kuberay_min_gpu_replicas = 2
+kuberay_min_gpu_replicas = 0  # Scale to zero when idle
 kuberay_max_gpu_replicas = 2  # Max 2 nodes (each with 8 GPUs)
 kuberay_gpu_resources = {
   cpus   = 120

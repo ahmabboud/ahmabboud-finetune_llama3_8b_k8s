@@ -111,6 +111,15 @@ configuration:
             template:
               spec:
                 restartPolicy: Never
+                affinity:
+                  nodeAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      nodeSelectorTerms:
+                        - matchExpressions:
+                            - key: nebius.com/gpu
+                              operator: NotIn
+                              values:
+                                - "true"
                 containers:
                   - name: ray-worker
                     image: ${cpu_worker_image}

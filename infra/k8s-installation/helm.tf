@@ -34,7 +34,7 @@ module "o11y" {
   tenant_id       = var.tenant_id
   cluster_id      = nebius_mk8s_v1_cluster.k8s-cluster.id
   cpu_nodes_count = var.cpu_nodes_count
-  gpu_nodes_count = var.gpu_nodes_count_per_group * var.gpu_node_groups
+  gpu_nodes_count = var.gpu_autoscaling_enabled ? var.gpu_max_nodes * var.gpu_node_groups : var.gpu_nodes_count_per_group * var.gpu_node_groups
 
   o11y = {
     loki = {
@@ -56,7 +56,7 @@ module "nccl-test" {
     module.gpu-operator,
   ]
   source          = "../modules/nccl-test"
-  number_of_hosts = nebius_mk8s_v1_node_group.gpu[0].fixed_node_count
+  number_of_hosts = var.gpu_autoscaling_enabled ? var.gpu_max_nodes : nebius_mk8s_v1_node_group.gpu[0].fixed_node_count
 }
 
 # Nebius GPU Health Checker

@@ -116,7 +116,25 @@ variable "cpu_disk_size" {
 
 # K8s GPU node group
 variable "gpu_nodes_count_per_group" {
-  description = "Number of nodes in the GPU node group."
+  description = "Number of nodes in the GPU node group (used when gpu_autoscaling_enabled=false)."
+  type        = number
+  default     = 2
+}
+
+variable "gpu_autoscaling_enabled" {
+  description = "Enable autoscaling for GPU node group (allows scale to zero)."
+  type        = bool
+  default     = false
+}
+
+variable "gpu_min_nodes" {
+  description = "Minimum number of GPU nodes when autoscaling is enabled (can be 0 for scale-to-zero)."
+  type        = number
+  default     = 0
+}
+
+variable "gpu_max_nodes" {
+  description = "Maximum number of GPU nodes when autoscaling is enabled."
   type        = number
   default     = 2
 }
