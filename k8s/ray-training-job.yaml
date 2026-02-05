@@ -180,12 +180,40 @@ data:
         if rank == 0:
             model.print_trainable_parameters()
         
-        # Load datasets
-        train_data = load_dataset("json", data_files=TRAIN_DATA, split="train")
-        val_data = load_dataset("json", data_files=VAL_DATA, split="train")
+        # Load datasets - use local cache to avoid cross-worker cache conflicts
+        # Each worker caches independently in /tmp (local to each node)
+        import tempfile
+        local_cache_dir = tempfile.mkdtemp(prefix="hf_cache_")
         
-        train_data = train_data.map(format_function_calling)
-        val_data = val_data.map(format_function_calling)
+        train_data = load_dataset(
+            "json", 
+            data_files=TRAIN_DATA, 
+            split="train",
+            cache_dir=local_cache_dir,
+        )
+        val_data = load_dataset(
+            "json", 
+            data_files=VAL_DATA, 
+            split="train",
+            cache_dir=local_cache_dir,
+        )
+        
+        # Map with load_from_cache_file=False to avoid cache conflicts across nodes
+        # Each worker processes the data independently but identically
+        train_data = train_data.map(format_function_calling, load_from_cache_file=False)
+        val_data = val_data.map(format_function_calling, load_from_cache_file=False)
+        
+        # Pre-tokenize the data to avoid SFTTrainer's internal tokenization which causes cache conflicts
+        def tokenize_function(examples):
+            return tokenizer(
+                examples["text"],
+                truncation=True,
+                max_length=2048,
+                padding=False,
+            )
+        
+        train_data = train_data.map(tokenize_function, batched=True, load_from_cache_file=False, remove_columns=["text"])
+        val_data = val_data.map(tokenize_function, batched=True, load_from_cache_file=False, remove_columns=["text"])
         
         # Training arguments with DDP (FSDP requires multi-GPU per process)
         training_args = TrainingArguments(
@@ -212,15 +240,17 @@ data:
         )
         
         # Create trainer
+        # Data is pre-tokenized, so skip SFTTrainer's internal preparation
+        # This avoids cache conflicts when multiple workers process data simultaneously
         trainer = SFTTrainer(
             model=model,
             args=training_args,
             train_dataset=train_data,
             eval_dataset=val_data,
             tokenizer=tokenizer,
-            dataset_text_field="text",
             max_seq_length=2048,
             packing=False,
+            dataset_kwargs={"skip_prepare_dataset": True},
         )
         
         # Check for existing checkpoints to resume from

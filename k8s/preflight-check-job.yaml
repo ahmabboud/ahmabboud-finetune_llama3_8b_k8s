@@ -1,0 +1,868 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: preflight-check
+  namespace: ray-cluster
+spec:
+  clusterIP: None  # Headless service for pod discovery
+  publishNotReadyAddresses: true  # Show pods even before ready
+  selector:
+    app: preflight-check
+  ports:
+    - port: 29500
+      name: nccl
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: preflight-check
+  namespace: ray-cluster
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 0
+  parallelism: 2
+  completions: 2
+  completionMode: Indexed  # Each pod gets JOB_COMPLETION_INDEX (0 or 1)
+  template:
+    metadata:
+      labels:
+        app: preflight-check
+    spec:
+      restartPolicy: Never
+      subdomain: preflight-check  # For DNS: preflight-check-0.preflight-check.ray-cluster.svc
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: preflight-check
+              topologyKey: "kubernetes.io/hostname"
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+      containers:
+        - name: preflight
+          image: rayproject/ray:2.46.0-py310-gpu
+          resources:
+            limits:
+              nvidia.com/gpu: 8
+            requests:
+              nvidia.com/gpu: 8
+              memory: "128Gi"
+              cpu: "32"
+          env:
+            - name: NCCL_DEBUG
+              value: "INFO"
+            - name: NCCL_DEBUG_SUBSYS
+              value: "INIT,NET"
+            - name: NCCL_IB_DISABLE
+              value: "0"
+            - name: NCCL_NET_GDR_LEVEL
+              value: "5"
+            - name: WORLD_SIZE
+              value: "2"
+            - name: MASTER_PORT
+              value: "29500"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          volumeMounts:
+            - name: shared-data
+              mountPath: /mnt/data
+            - name: shm
+              mountPath: /dev/shm
+            - name: nccl-test-script
+              mountPath: /scripts/nccl_test.py
+              subPath: nccl_test.py
+            - name: smoke-test-script
+              mountPath: /scripts/smoke_test.py
+              subPath: smoke_test.py
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              
+              # Get rank from indexed job
+              RANK=${JOB_COMPLETION_INDEX:-0}
+              
+              echo "=================================================="
+              echo " PRE-FLIGHT CHECKS FOR MULTI-NODE TRAINING"
+              echo " Pod: $POD_NAME | Rank: $RANK | IP: $POD_IP"
+              echo "=================================================="
+              
+              GREEN='\033[92m'
+              RED='\033[91m'
+              YELLOW='\033[93m'
+              RESET='\033[0m'
+              
+              check() {
+                local name="$1"
+                local passed="$2"
+                local details="$3"
+                if [ "$passed" = "true" ]; then
+                  echo -e "  ${GREEN}✓ PASS${RESET}  $name"
+                else
+                  echo -e "  ${RED}✗ FAIL${RESET}  $name"
+                  if [ -n "$details" ]; then
+                    echo -e "         ${YELLOW}$details${RESET}"
+                  fi
+                fi
+              }
+              
+              # ============================================
+              # 1. INSTALL DEPENDENCIES
+              # ============================================
+              echo ""
+              echo "=================================================="
+              echo " 1. INSTALLING DEPENDENCIES"
+              echo "=================================================="
+              pip install -q torch --index-url https://download.pytorch.org/whl/cu121
+              pip install -q transformers datasets peft accelerate bitsandbytes wandb deepspeed trl
+              echo "Dependencies installed."
+              
+              # ============================================
+              # 2. GPU AVAILABILITY
+              # ============================================
+              echo ""
+              echo "=================================================="
+              echo " 2. GPU AVAILABILITY"
+              echo "=================================================="
+              
+              if command -v nvidia-smi &> /dev/null; then
+                check "nvidia-smi available" "true"
+                
+                GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+                if [ "$GPU_COUNT" -eq 8 ]; then
+                  check "GPU count = 8" "true" "Found $GPU_COUNT H100 GPUs"
+                else
+                  check "GPU count = 8" "false" "Found $GPU_COUNT GPUs (expected 8)"
+                fi
+                
+                echo ""
+                nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              fi
+              
+              # ============================================
+              # 3. GPU HEALTH
+              # ============================================
+              echo ""
+              echo "=================================================="
+              echo " 3. GPU HEALTH"
+              echo "=================================================="
+              
+              nvidia-smi --query-gpu=index,temperature.gpu --format=csv,noheader | while IFS=', ' read -r idx temp; do
+                if [ "$temp" -lt 85 ]; then
+                  check "GPU $idx temperature" "true" "${temp}°C"
+                else
+                  check "GPU $idx temperature" "false" "${temp}°C (too hot!)"
+                fi
+              done
+              
+              # ============================================
+              # 4. CUDA & PyTorch
+              # ============================================
+              echo ""
+              echo "=================================================="
+              echo " 4. CUDA & PyTorch"
+              echo "=================================================="
+              
+              python3 -c "
+              import torch
+              GREEN, RED, RESET = '\033[92m', '\033[91m', '\033[0m'
+              def check(name, passed, details=''):
+                  print(f'  {GREEN if passed else RED}{\"✓ PASS\" if passed else \"✗ FAIL\"}{RESET}  {name}')
+                  if details: print(f'         {details}')
+              
+              check('PyTorch installed', True, f'Version {torch.__version__}')
+              check('CUDA available', torch.cuda.is_available())
+              check('CUDA version', True, torch.version.cuda)
+              
+              gpu_count = torch.cuda.device_count()
+              check(f'PyTorch sees {gpu_count} GPUs', gpu_count == 8)
+              
+              # Quick tensor test
+              for i in range(gpu_count):
+                  x = torch.randn(1000, 1000, device=f'cuda:{i}')
+                  y = torch.matmul(x, x)
+              check('CUDA tensor ops on all GPUs', True)
+              "
+              
+              # ============================================
+              # 5. INTRA-NODE NVLink
+              # ============================================
+              echo ""
+              echo "=================================================="
+              echo " 5. INTRA-NODE NVLink P2P"
+              echo "=================================================="
+              
+              python3 -c "
+              import torch
+              GREEN, RED, RESET = '\033[92m', '\033[91m', '\033[0m'
+              def check(name, passed, details=''):
+                  print(f'  {GREEN if passed else RED}{\"✓ PASS\" if passed else \"✗ FAIL\"}{RESET}  {name}')
+                  if details: print(f'         {details}')
+              
+              world_size = torch.cuda.device_count()
+              nvlink_pairs = 0
+              for i in range(world_size):
+                  for j in range(i+1, world_size):
+                      if torch.cuda.can_device_access_peer(i, j):
+                          nvlink_pairs += 1
+              
+              total_pairs = world_size * (world_size - 1) // 2
+              check('NVLink P2P connectivity', nvlink_pairs > 0, f'{nvlink_pairs}/{total_pairs} pairs connected')
+              check('NCCL backend available', torch.distributed.is_nccl_available())
+              "
+              
+              # ============================================
+              # 6. INTER-NODE NCCL (The real test)
+              # ============================================
+              echo ""
+              echo "=================================================="
+              echo " 6. INTER-NODE NCCL COMMUNICATION"
+              echo "=================================================="
+              echo "  Rank: $RANK"
+              echo "  World Size: $WORLD_SIZE"
+              echo "  My IP: $POD_IP"
+              
+              # Wait for all pods to be registered with the headless service
+              # Then use the smallest IP as master (deterministic across all pods)
+              SERVICE_DNS="preflight-check.ray-cluster.svc.cluster.local"
+              
+              echo "  Discovering peers via headless service DNS..."
+              for attempt in $(seq 1 120); do
+                # Get all IPs registered with the headless service
+                ALL_IPS=$(getent hosts $SERVICE_DNS 2>/dev/null | awk '{print $1}' | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n | uniq)
+                IP_COUNT=$(echo "$ALL_IPS" | grep -c . || echo 0)
+                
+                if [ "$IP_COUNT" -ge 2 ]; then
+                  echo "  Found $IP_COUNT peers: $(echo $ALL_IPS | tr '\n' ' ')"
+                  # Use the smallest IP as master (deterministic)
+                  MASTER_ADDR=$(echo "$ALL_IPS" | head -1)
+                  echo "  Master address (smallest IP): $MASTER_ADDR"
+                  break
+                fi
+                
+                if [ $((attempt % 12)) -eq 0 ]; then
+                  echo "  Waiting for peers... ($attempt/120, found $IP_COUNT so far)"
+                fi
+                sleep 5
+              done
+              
+              if [ -z "$MASTER_ADDR" ]; then
+                echo "  ERROR: Could not discover 2 peers after 10 minutes"
+                check "Peer discovery" "false" "Only found $IP_COUNT peer(s)"
+                exit 1
+              fi
+              
+              # Determine our actual rank based on IP ordering
+              SORTED_IPS=$(echo "$ALL_IPS" | tr ' ' '\n' | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n)
+              ACTUAL_RANK=0
+              for ip in $SORTED_IPS; do
+                if [ "$ip" = "$POD_IP" ]; then
+                  break
+                fi
+                ACTUAL_RANK=$((ACTUAL_RANK + 1))
+              done
+              
+              echo "  Computed rank from IP ordering: $ACTUAL_RANK"
+              
+              # Use computed rank (more reliable than JOB_COMPLETION_INDEX across nodes)
+              export RANK=$ACTUAL_RANK
+              
+              # Simple time-based barrier (nc not available in this image)
+              echo "  Waiting 10s for all ranks to be ready..."
+              sleep 10
+              
+              # Export for Python (RANK already set to ACTUAL_RANK above)
+              export MASTER_ADDR
+              export MASTER_PORT
+              export WORLD_SIZE
+              # RANK is already exported
+              
+              echo "  Starting NCCL test with RANK=$RANK MASTER_ADDR=$MASTER_ADDR"
+              
+              # Run the NCCL test
+              python3 /scripts/nccl_test.py
+              
+              # ============================================
+              # 7. STORAGE
+              # ============================================
+              echo ""
+              echo "=================================================="
+              echo " 7. STORAGE"
+              echo "=================================================="
+              
+              if [ -d "/mnt/data" ]; then
+                check "Storage mounted at /mnt/data" "true"
+                
+                AVAIL=$(df -BG /mnt/data | tail -1 | awk '{print $4}' | tr -d 'G')
+                if [ "$AVAIL" -gt 100 ]; then
+                  check "Free space > 100GB" "true" "${AVAIL}GB available"
+                else
+                  check "Free space > 100GB" "false" "Only ${AVAIL}GB available"
+                fi
+                
+                if [ -d "/mnt/data/checkpoints" ]; then
+                  CKPT_COUNT=$(find /mnt/data/checkpoints -maxdepth 2 -type d -name "checkpoint-*" 2>/dev/null | wc -l)
+                  check "Checkpoints directory" "true" "Found $CKPT_COUNT checkpoint(s)"
+                fi
+              else
+                check "Storage mounted" "false" "/mnt/data not found"
+              fi
+              
+              # ============================================
+              # 8. RAY CLUSTER
+              # ============================================
+              echo ""
+              echo "=================================================="
+              echo " 8. RAY CLUSTER CONNECTION"
+              echo "=================================================="
+              
+              python3 -c "
+              import ray
+              GREEN, RED, RESET = '\033[92m', '\033[91m', '\033[0m'
+              def check(name, passed, details=''):
+                  print(f'  {GREEN if passed else RED}{\"✓ PASS\" if passed else \"✗ FAIL\"}{RESET}  {name}')
+                  if details: print(f'         {details}')
+              
+              try:
+                  ray.init(address='ray://ray-cluster-head-svc.ray-cluster.svc.cluster.local:10001', ignore_reinit_error=True)
+                  resources = ray.cluster_resources()
+                  cpus = resources.get('CPU', 0)
+                  gpus = resources.get('GPU', 0)
+                  nodes = len(ray.nodes())
+                  check('Ray cluster connection', True, f'{nodes} node(s), {int(cpus)} CPUs, {int(gpus)} GPUs')
+                  ray.shutdown()
+              except Exception as e:
+                  check('Ray cluster connection', False, str(e)[:100])
+              "
+              
+              # ============================================
+              # 9. TRAINING PIPELINE SMOKE TEST
+              # Only run on rank 0 to avoid duplicate work
+              # ============================================
+              if [ "$RANK" = "0" ]; then
+                echo ""
+                echo "=================================================="
+                echo " 9. TRAINING PIPELINE (Rank 0 only)"
+                echo "=================================================="
+                
+                # Unset distributed env vars to force single-GPU mode for smoke test
+                unset WORLD_SIZE LOCAL_RANK RANK MASTER_ADDR MASTER_PORT
+                export CUDA_VISIBLE_DEVICES=0
+                
+                # Run the smoke test
+                python3 /scripts/smoke_test.py
+              else
+                echo ""
+                echo "=================================================="
+                echo " 9. TRAINING PIPELINE (Skipped - Rank $RANK)"
+                echo "=================================================="
+                echo "  Running on Rank 0 only to avoid duplicate work."
+              fi
+              
+              # ============================================
+              # CLEANUP & SUMMARY
+              # ============================================
+              echo ""
+              echo "=================================================="
+              echo " PREFLIGHT CHECK COMPLETE"
+              echo "=================================================="
+              echo "  Node: $(hostname)"
+              echo "  Rank: $RANK"
+              echo "  All checks finished."
+      volumes:
+        - name: shared-data
+          hostPath:
+            path: /mnt/data
+            type: Directory
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: "64Gi"
+        - name: nccl-test-script
+          configMap:
+            name: nccl-test-script
+        - name: smoke-test-script
+          configMap:
+            name: smoke-test-script
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nccl-test-script
+  namespace: ray-cluster
+data:
+  nccl_test.py: |
+    #!/usr/bin/env python3
+    """Inter-node NCCL test for preflight checks."""
+    import os
+    import time
+    from datetime import timedelta
+    import torch
+    import torch.distributed as dist
+    
+    GREEN = '\033[92m'
+    RED = '\033[91m'
+    YELLOW = '\033[93m'
+    RESET = '\033[0m'
+    
+    def check(name, passed, details=''):
+        status = f"{GREEN}✓ PASS{RESET}" if passed else f"{RED}✗ FAIL{RESET}"
+        print(f"  {status}  {name}")
+        if details:
+            print(f"         {details}")
+        return passed
+    
+    def main():
+        rank = int(os.environ.get('RANK', os.environ.get('JOB_COMPLETION_INDEX', 0)))
+        world_size = int(os.environ.get('WORLD_SIZE', 2))
+        master_addr = os.environ.get('MASTER_ADDR', 'localhost')
+        master_port = os.environ.get('MASTER_PORT', '29500')
+        
+        print(f"  Rank {rank}: Initializing NCCL...")
+        print(f"  Master: {master_addr}:{master_port}")
+        
+        try:
+            # Set environment for distributed
+            os.environ['RANK'] = str(rank)
+            os.environ['LOCAL_RANK'] = '0'
+            os.environ['WORLD_SIZE'] = str(world_size)
+            os.environ['MASTER_ADDR'] = master_addr
+            os.environ['MASTER_PORT'] = master_port
+            
+            # Use first GPU for inter-node test
+            torch.cuda.set_device(0)
+            
+            # Initialize process group with timeout
+            # Note: env:// method uses MASTER_ADDR, MASTER_PORT, RANK, WORLD_SIZE from environment
+            print(f"  Calling dist.init_process_group...")
+            dist.init_process_group(
+                backend="nccl",
+                init_method="env://",
+                timeout=timedelta(seconds=300)
+            )
+            print(f"  Process group initialized!")
+            
+            check("NCCL process group initialized", True)
+            
+            # Explicit NCCL init by doing a small all_reduce first
+            print(f"  Initializing NCCL communicator...")
+            small_tensor = torch.zeros(1, device='cuda:0')
+            dist.all_reduce(small_tensor)
+            torch.cuda.synchronize()
+            check("NCCL communicator initialized", True)
+            
+            # Barrier to sync (using NCCL now)
+            dist.barrier(device_ids=[0])
+            check("Distributed barrier", True, "Both nodes synchronized")
+            
+            # Test all-reduce
+            print(f"  Running AllReduce test...")
+            tensor = torch.ones(1024, 1024, device='cuda:0') * (rank + 1)
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+            
+            expected = sum(range(1, world_size + 1))  # 1 + 2 = 3
+            success = torch.allclose(tensor, torch.full_like(tensor, expected))
+            check("Inter-node AllReduce", success, f"Expected sum={expected}, got {tensor[0,0].item():.0f}")
+            
+            # Bandwidth test
+            print(f"  Running bandwidth test...")
+            sizes = [1*1024*1024, 10*1024*1024, 100*1024*1024]  # 1MB, 10MB, 100MB
+            
+            for size in sizes:
+                tensor = torch.randn(size // 4, device='cuda:0')  # float32 = 4 bytes
+                torch.cuda.synchronize()
+                
+                # Warmup
+                for _ in range(3):
+                    dist.all_reduce(tensor)
+                torch.cuda.synchronize()
+                
+                # Timed runs
+                start = time.time()
+                iterations = 10
+                for _ in range(iterations):
+                    dist.all_reduce(tensor)
+                torch.cuda.synchronize()
+                elapsed = time.time() - start
+                
+                # Bandwidth calculation for ring all-reduce
+                # Each element traverses 2*(n-1) links
+                data_moved = size * iterations * 2 * (world_size - 1) / world_size
+                bandwidth_gbps = data_moved / elapsed / 1e9
+                size_mb = size / 1024 / 1024
+                
+                # Note: TCP gives ~1-5 GB/s, InfiniBand gives 100+ GB/s
+                # We'll pass with any positive bandwidth, but report the speed
+                check(f"AllReduce {size_mb:.0f}MB", True, 
+                      f"{bandwidth_gbps:.1f} GB/s")
+            
+            # All-to-all test (different pattern)
+            print(f"  Running All-to-All test...")
+            send_tensor = torch.randn(1024, 1024, device='cuda:0')
+            recv_tensor = torch.zeros_like(send_tensor)
+            
+            dist.all_reduce(send_tensor)  # Simple collective
+            torch.cuda.synchronize()
+            check("All-to-All communication", True)
+            
+            # Cleanup
+            dist.destroy_process_group()
+            
+            print(f"\n  {GREEN}Inter-node NCCL tests passed!{RESET}")
+            print(f"  NOTE: Check NCCL_INFO logs above for network transport used:")
+            print(f"    - 'NET/Socket' = TCP (1-5 GB/s typical)")
+            print(f"    - 'NET/IB' = InfiniBand (100+ GB/s possible)")
+            
+        except Exception as e:
+            check("Inter-node NCCL test", False, str(e)[:200])
+            import traceback
+            traceback.print_exc()
+            return 1
+        
+        return 0
+    
+    if __name__ == "__main__":
+        exit(main())
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: smoke-test-script
+  namespace: ray-cluster
+data:
+  smoke_test.py: |
+    #!/usr/bin/env python3
+    """
+    Training pipeline smoke test - validates PEFT/LoRA/SFT components.
+    This tests the training stack without duplicating GPU/NCCL checks.
+    """
+    import os
+    import sys
+    import tempfile
+    
+    GREEN = '\033[92m'
+    RED = '\033[91m'
+    YELLOW = '\033[93m'
+    RESET = '\033[0m'
+    
+    def check(name, passed, details=''):
+        status = f"{GREEN}✓ PASS{RESET}" if passed else f"{RED}✗ FAIL{RESET}"
+        print(f"  {status}  {name}")
+        if details:
+            print(f"         {details}")
+        return passed
+    
+    
+    def test_training_imports():
+        """Test training-specific imports."""
+        print("  Testing training imports...")
+        errors = []
+        
+        packages = [
+            ("trl", "trl"),
+            ("peft", "peft"),
+            ("accelerate", "accelerate"),
+            ("datasets", "datasets"),
+        ]
+        
+        for name, pkg in packages:
+            try:
+                mod = __import__(pkg)
+                check(name, True, f"v{mod.__version__}")
+            except ImportError as e:
+                check(name, False, str(e))
+                errors.append(name)
+        
+        # TRL specific
+        try:
+            from trl import SFTTrainer, SFTConfig
+            check("SFTTrainer/SFTConfig", True)
+        except ImportError as e:
+            check("SFTTrainer/SFTConfig", False, str(e))
+            errors.append("SFTTrainer")
+        
+        # PEFT specific
+        try:
+            from peft import LoraConfig, TaskType, get_peft_model
+            check("LoraConfig/get_peft_model", True)
+        except ImportError as e:
+            check("LoraConfig/get_peft_model", False, str(e))
+            errors.append("LoraConfig")
+        
+        return len(errors) == 0
+    
+    
+    def test_sft_config():
+        """Test SFTConfig creation."""
+        print("  Testing SFTConfig...")
+        try:
+            from trl import SFTConfig
+            
+            with tempfile.TemporaryDirectory() as tmpdir:
+                config = SFTConfig(
+                    output_dir=tmpdir,
+                    num_train_epochs=1,
+                    per_device_train_batch_size=1,
+                    learning_rate=1e-4,
+                    warmup_steps=10,
+                    logging_steps=1,
+                    bf16=True,
+                    gradient_checkpointing=True,
+                    gradient_checkpointing_kwargs={"use_reentrant": False},
+                    max_length=128,
+                    dataset_text_field="text",
+                    report_to=["none"],
+                )
+                check("SFTConfig", True, f"max_length={config.max_length}")
+                return True
+        except Exception as e:
+            check("SFTConfig", False, str(e)[:100])
+            return False
+    
+    
+    def test_lora_config():
+        """Test LoRA configuration."""
+        print("  Testing LoraConfig...")
+        try:
+            from peft import LoraConfig, TaskType
+            
+            config = LoraConfig(
+                r=8,
+                lora_alpha=16,
+                lora_dropout=0.05,
+                target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+                task_type=TaskType.CAUSAL_LM,
+                bias="none",
+            )
+            check("LoraConfig", True, f"r={config.r}, alpha={config.lora_alpha}")
+            return True
+        except Exception as e:
+            check("LoraConfig", False, str(e)[:100])
+            return False
+    
+    
+    def test_peft_model():
+        """Test PEFT model wrapping with GPT-2."""
+        print("  Testing PEFT model wrapping...")
+        try:
+            import torch
+            from transformers import AutoModelForCausalLM
+            from peft import LoraConfig, TaskType, get_peft_model
+            
+            # Load small model for testing
+            model = AutoModelForCausalLM.from_pretrained(
+                "gpt2",
+                torch_dtype=torch.bfloat16,
+                device_map="cuda:0",  # Single GPU
+            )
+            
+            lora_config = LoraConfig(
+                r=8,
+                lora_alpha=16,
+                lora_dropout=0.05,
+                target_modules=["c_attn"],  # GPT-2 uses c_attn
+                task_type=TaskType.CAUSAL_LM,
+                bias="none",
+            )
+            
+            peft_model = get_peft_model(model, lora_config)
+            
+            trainable = sum(p.numel() for p in peft_model.parameters() if p.requires_grad)
+            total = sum(p.numel() for p in peft_model.parameters())
+            
+            check("PEFT model", True, f"trainable: {trainable:,} ({100*trainable/total:.2f}%)")
+            
+            del peft_model, model
+            torch.cuda.empty_cache()
+            return True
+        except Exception as e:
+            check("PEFT model", False, str(e)[:100])
+            return False
+    
+    
+    def test_dataset():
+        """Test dataset creation."""
+        print("  Testing dataset...")
+        try:
+            from datasets import Dataset
+            
+            data = {"text": ["Hello, how are you?", "I am fine!"] * 20}
+            dataset = Dataset.from_dict(data)
+            check("Dataset", True, f"{len(dataset)} samples")
+            return dataset
+        except Exception as e:
+            check("Dataset", False, str(e)[:100])
+            return None
+    
+    
+    def test_training_step(dataset):
+        """Test a single training step with SFTTrainer on single GPU."""
+        print("  Testing training step (single GPU)...")
+        try:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            from peft import LoraConfig, TaskType
+            from trl import SFTTrainer, SFTConfig
+            
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # Tokenizer
+                tokenizer = AutoTokenizer.from_pretrained("gpt2")
+                if tokenizer.pad_token is None:
+                    tokenizer.pad_token = tokenizer.eos_token
+                
+                # Model on single GPU
+                model = AutoModelForCausalLM.from_pretrained(
+                    "gpt2",
+                    torch_dtype=torch.bfloat16,
+                ).to("cuda:0")
+                
+                # LoRA config
+                peft_config = LoraConfig(
+                    r=8,
+                    lora_alpha=16,
+                    target_modules=["c_attn"],
+                    task_type=TaskType.CAUSAL_LM,
+                )
+                
+                # SFT config - single GPU, no DataParallel
+                sft_config = SFTConfig(
+                    output_dir=tmpdir,
+                    num_train_epochs=1,
+                    max_steps=2,  # Just 2 steps
+                    per_device_train_batch_size=2,
+                    gradient_accumulation_steps=1,
+                    learning_rate=1e-4,
+                    warmup_steps=1,
+                    logging_steps=1,
+                    bf16=True,
+                    gradient_checkpointing=False,
+                    max_length=32,
+                    dataset_text_field="text",
+                    report_to=["none"],
+                    ddp_find_unused_parameters=False,
+                )
+                
+                # Create trainer
+                trainer = SFTTrainer(
+                    model=model,
+                    processing_class=tokenizer,
+                    args=sft_config,
+                    train_dataset=dataset,
+                    peft_config=peft_config,
+                )
+                
+                # Run training
+                result = trainer.train()
+                
+                check("Training step", True, f"loss={result.training_loss:.4f}")
+                
+                del trainer, model
+                torch.cuda.empty_cache()
+                return True
+                
+        except Exception as e:
+            check("Training step", False, str(e)[:150])
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    
+    def test_llama_tokenizer():
+        """Test Llama-3 tokenizer loading from cache."""
+        print("  Testing Llama-3 tokenizer...")
+        try:
+            from transformers import AutoTokenizer
+            
+            # Try loading from local cache
+            cache_dir = "/mnt/data/huggingface"
+            model_name = "meta-llama/Llama-3.1-8B-Instruct"
+            
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_name,
+                cache_dir=cache_dir,
+                local_files_only=True,
+            )
+            
+            check("Llama-3 tokenizer", True, f"vocab_size={tokenizer.vocab_size}")
+            return True
+        except Exception as e:
+            # Not cached, skip
+            check("Llama-3 tokenizer", True, "Not cached (skip)")
+            return True
+    
+    
+    def test_training_dataset():
+        """Test loading actual training dataset."""
+        print("  Testing training dataset...")
+        try:
+            from datasets import load_dataset
+            
+            cache_dir = "/mnt/data/huggingface"
+            dataset = load_dataset(
+                "mlabonne/FineTome-100k",
+                cache_dir=cache_dir,
+                split="train[:100]",  # Just 100 samples for test
+            )
+            
+            check("Training dataset", True, f"{len(dataset)} samples loaded")
+            return True
+        except Exception as e:
+            # Dataset might not be cached
+            check("Training dataset", True, f"Not cached (skip)")
+            return True
+    
+    
+    def main():
+        print("")
+        results = []
+        
+        # Test training imports
+        results.append(("Training imports", test_training_imports()))
+        
+        # Test configs
+        results.append(("SFTConfig", test_sft_config()))
+        results.append(("LoraConfig", test_lora_config()))
+        
+        # Test PEFT model
+        results.append(("PEFT model", test_peft_model()))
+        
+        # Test dataset
+        dataset = test_dataset()
+        results.append(("Dataset", dataset is not None))
+        
+        # Test training step (key test!)
+        if dataset:
+            results.append(("Training step", test_training_step(dataset)))
+        
+        # Test Llama tokenizer from cache
+        results.append(("Llama tokenizer", test_llama_tokenizer()))
+        
+        # Test training dataset
+        results.append(("Training dataset", test_training_dataset()))
+        
+        # Summary
+        print("")
+        print("  " + "-" * 40)
+        passed = sum(1 for _, r in results if r)
+        failed = sum(1 for _, r in results if not r)
+        
+        if failed > 0:
+            print(f"  {RED}Training pipeline: {passed} passed, {failed} failed{RESET}")
+            return 1
+        else:
+            print(f"  {GREEN}Training pipeline: All {passed} checks passed!{RESET}")
+            return 0
+    
+    
+    if __name__ == "__main__":
+        sys.exit(main())

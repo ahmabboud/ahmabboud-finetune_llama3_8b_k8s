@@ -2,7 +2,7 @@
 .env
 *.pem
 .DS_Store
-upstream/*
+upstream/
 infra/k8s-installation/environment.sh
 temp/
 checkpoints/
@@ -11,3 +11,9 @@ __pycache__/
 *.tfplan
 tfplan
 .DS_Store
+
+# Unused/archived files
+.tmp/
+src/
+configs/
+tools/
