@@ -30,6 +30,35 @@ resource "nebius_applications_v1alpha1_k8s_release" "prometheus" {
   }
 }
 
+# Loki datasource for Grafana (provisioned via sidecar)
+resource "kubernetes_config_map" "grafana_loki_datasource" {
+  count = var.o11y.prometheus.enabled && var.o11y.loki.enabled ? 1 : 0
+
+  metadata {
+    name      = "grafana-loki-datasource"
+    namespace = var.namespace
+    labels = {
+      grafana_datasource = "1"
+    }
+  }
+
+  data = {
+    "loki-datasource.yaml" = <<-EOT
+      apiVersion: 1
+      datasources:
+      - name: Loki
+        type: loki
+        access: proxy
+        url: http://loki-gateway.${var.namespace}.svc.cluster.local
+        isDefault: false
+    EOT
+  }
+
+  depends_on = [
+    nebius_applications_v1alpha1_k8s_release.prometheus
+  ]
+}
+
 resource "time_static" "restarted_at" {}
 
 resource "kubernetes_annotations" "restart_grafana" {

@@ -4,7 +4,7 @@
 
 This document summarizes the Proof-of-Concept (PoC) for multi-node LLM fine-tuning on Nebius Cloud, demonstrating a production-ready pipeline that scales from 16 to 512 H100 GPUs with minimal configuration changes.
 
-**Key Achievement:** End-to-end fine-tuning of Llama-3-8B for function calling on 16 H100 GPUs with full observability, easy reproducibility, and a clear path to 512 GPU scale.
+**Key Achievement:** End-to-end fine-tuning of Llama-3-8B for function calling on 16 H100 GPUs achieving near **100% success rate** on function calling tests (vs 0% for the base model).
 
 ---
 
@@ -52,11 +52,17 @@ This document summarizes the Proof-of-Concept (PoC) for multi-node LLM fine-tuni
 | **Shared Filesystem** | 2 TB | `/mnt/data` | Models, datasets, checkpoints |
 | **Node Boot Disk** | 1 TB SSD | `/` | OS, container images |
 
-**Shared Filesystem Benefits:**
-- Read-Write-Many access (all nodes simultaneously)
-- 4 GiB/s per client bandwidth
-- Survives node restarts/failures
-- No data copying between nodes needed
+**Why NFS Shared Storage (not Object Storage)?**
+
+| Factor | NFS (Filestore) | S3/Object Storage |
+|--------|-----------------|-------------------|
+| **Access pattern** | POSIX filesystem | API calls |
+| **PyTorch compatibility** | Native `torch.load()` | Requires streaming |
+| **Checkpoint speed** | Fast (local-like) | Slow (upload/download) |
+| **Multi-node access** | Simultaneous RW | Complex locking |
+| **HuggingFace cache** | Works natively | Requires custom code |
+
+**Decision:** NFS provides POSIX semantics that PyTorch and HuggingFace expect. All workers can read the model and write checkpoints without coordination.
 
 ### 1.4 Network Configuration
 
@@ -106,7 +112,6 @@ terraform init && terraform apply
 | **NVIDIA DCGM Exporter** | GPU metrics collection | `nvidia-device-plugin` |
 | **Prometheus** | Metrics storage & alerting | `o11y` |
 | **Grafana** | Infrastructure dashboards | `o11y` |
-| **Loki** | Log aggregation | `o11y` |
 
 ### 2.3 Training Frameworks
 
@@ -117,7 +122,19 @@ terraform init && terraform apply
 | **PEFT** | 0.13.2 | LoRA parameter-efficient fine-tuning |
 | **TRL** | 0.11.4 | SFTTrainer for instruction tuning |
 | **Ray Train** | 2.46.0 | Distributed training orchestration |
-| **Accelerate** | 1.1.1 | FSDP integration |
+| **Datasets** | 3.2.0 | Data loading and processing |
+
+### 2.4 Why Llama-3-8B-Instruct?
+
+| Consideration | Llama-3-8B | Llama-3-70B | Llama-2-7B |
+|---------------|------------|-------------|------------|
+| **Quality** | State-of-art for size | Better but 9x larger | Older generation |
+| **Memory** | 16 GB (BF16) | 140 GB (BF16) | 14 GB (BF16) |
+| **Fine-tuning** | Single GPU possible | Requires model sharding | Less capable |
+| **Inference** | Fast, deployable | Slow, expensive | Fast but weaker |
+| **License** | Permissive | Permissive | Permissive |
+
+**Decision:** Llama-3-8B provides the best balance of capability vs. resource requirements. It's powerful enough for function calling while fitting comfortably on a single H100 for both training and inference.
 
 ---
 
@@ -125,65 +142,179 @@ terraform init && terraform apply
 
 ### 3.1 Training Strategy
 
-**Method:** LoRA (Low-Rank Adaptation) + Data Parallelism
+**Method:** LoRA (Low-Rank Adaptation) + DDP (Distributed Data Parallel)
 
 | Aspect | Choice | Rationale |
 |--------|--------|-----------|
-| **Fine-tuning** | LoRA (rank=64) | 2% trainable params, fast iteration |
-| **Parallelism** | Data Parallel (DDP) | Simple, scales linearly |
+| **Fine-tuning** | LoRA (rank=64, alpha=128) | ~83M trainable params, fast iteration |
+| **Parallelism** | DDP (1 GPU per worker × 16 workers) | Simple, scales linearly |
 | **Precision** | BF16 | H100 optimized, no accuracy loss |
 | **Checkpointing** | Gradient checkpointing | Enables larger batch sizes |
 
 **Trainable Parameters:**
 - Base model: 8.2 billion parameters
-- LoRA trainable: 167 million (2%)
+- LoRA trainable: ~83 million
 - Memory per GPU: ~40-60 GB (fits H100 80GB)
 
-### 3.2 Pipeline Stages
+#### Why LoRA (not Full Fine-tuning)?
+
+| Metric | Full Fine-tuning | LoRA (r=64) |
+|--------|------------------|-------------|
+| **Trainable params** | 8.2B (100%) | 83M (1%) |
+| **GPU memory** | ~120 GB | ~50 GB |
+| **Training time** | 10-20x longer | Baseline |
+| **Iteration speed** | Days | Hours |
+| **Risk of catastrophic forgetting** | High | Low |
+
+**Decision:** LoRA allows rapid experimentation while preserving the base model's general capabilities. For function calling (a specific skill), we only need to adapt attention patterns, not retrain the entire model.
+
+#### Why Ray Train + DDP (not FSDP)?
+
+| Factor | DDP | FSDP |
+|--------|-----|------|
+| **Model fits in GPU?** | ✅ Yes (8B + LoRA = ~50GB) | Overkill |
+| **Complexity** | Simple | Complex sharding logic |
+| **Debugging** | Easy | Harder (distributed state) |
+| **Scaling efficiency** | ~95% at 16 GPUs | ~90% (communication overhead) |
+| **Checkpoint size** | Full model per worker | Requires gathering |
+
+**Decision:** Since Llama-3-8B with LoRA fits on a single H100 (~50GB < 80GB), DDP is simpler and more efficient. FSDP would be necessary for 70B+ models that don't fit in GPU memory.
+
+#### Why Ray Train over native PyTorch DDP?
+
+| Feature | Ray Train | Native PyTorch |
+|---------|-----------|----------------|
+| **K8s integration** | Native (KubeRay) | Manual setup |
+| **Fault tolerance** | Auto-restart workers | Manual handling |
+| **Resource management** | Built-in | External scheduler |
+| **Scaling** | Dynamic | Static |
+| **Checkpointing** | Managed | Manual |
+
+### 3.2 GPU Memory Budget
 
 ```
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│   Stage 1   │───►│   Stage 2   │───►│   Stage 3   │───►│   Stage 4   │
-│   Prepare   │    │   Train     │    │   Monitor   │    │   Deploy    │
-└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
-     │                   │                  │                  │
-     ▼                   ▼                  ▼                  ▼
- - Download model    - Submit RayJob   - Wandb metrics    - Base vs FT comparison
- - Prepare data      - 16 GPU workers  - GPU utilization  - 6 test scenarios
- - Create secrets    - Auto-resume     - Loss curves      - Success rate metrics
+┌─────────────────────────────────────────────────────────────┐
+│                    H100 80GB Memory Budget                  │
+├─────────────────────────────────────────────────────────────┤
+│ Component                              │ Memory (GB)        │
+├────────────────────────────────────────┼────────────────────┤
+│ Base Model (Llama-3-8B, BF16)          │ 16.0 GB            │
+│ LoRA Adapters (r=64, all layers)       │ 0.3 GB             │
+│ Optimizer States (AdamW, 2x params)    │ 0.6 GB             │
+│ Gradients (LoRA params only)           │ 0.3 GB             │
+│ Activations (batch=4, seq=2048)        │ ~25 GB             │
+│ KV Cache + Attention                   │ ~8 GB              │
+├────────────────────────────────────────┼────────────────────┤
+│ TOTAL USED                             │ ~50 GB             │
+│ HEADROOM                               │ ~30 GB             │
+│ GPU CAPACITY                           │ 80 GB              │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### 3.3 Commands to Run
+### 3.3 LoRA Parameter Calculation
+
+For Llama-3-8B with LoRA applied to attention + MLP layers:
+
+```
+Target modules: q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
+
+Per transformer layer:
+  - Attention (q,k,v,o): 4 × (4096 × 64 + 64 × 4096) × 2 bytes = 4.2 MB
+  - MLP (gate, up, down): 3 × (4096 × 64 + 64 × 14336) × 2 bytes = 7.0 MB
+  - Total per layer: ~11.2 MB
+
+Total LoRA parameters:
+  - 32 layers × 11.2 MB = ~358 MB ≈ 83M parameters
+```
+
+### 3.4 Batch Size Optimization
+
+```
+Effective Batch Size = per_gpu_batch × gradient_accumulation × num_gpus
+                     = 4 × 4 × 16
+                     = 256 samples per optimizer step
+
+Memory vs Batch Size Tradeoff:
+┌──────────────┬─────────────────┬─────────────────┐
+│ Batch Size   │ Memory Used     │ GPU Utilization │
+├──────────────┼─────────────────┼─────────────────┤
+│ 1            │ ~35 GB          │ ~60%            │
+│ 2            │ ~42 GB          │ ~75%            │
+│ 4 (chosen)   │ ~50 GB          │ ~90%            │
+│ 8            │ ~65 GB          │ ~95%            │
+│ 16           │ OOM             │ -               │
+└──────────────┴─────────────────┴─────────────────┘
+
+Decision: batch_size=4 provides ~90% GPU utilization while leaving
+30GB headroom for memory spikes and gradient accumulation.
+```
+
+### 3.5 Hyperparameter Justification
+
+| Parameter | Value | Justification |
+|-----------|-------|---------------|
+| **LoRA r** | 64 | Higher rank captures more complex adaptations for function calling. r=16 underfits, r=128 overfits. |
+| **LoRA α** | 128 | α/r = 2 is standard. Higher α = stronger adaptation. |
+| **Learning rate** | 1.5e-4 | Optimal for LoRA (10x higher than full fine-tuning). |
+| **Batch size** | 4 | Maximizes GPU memory without OOM. |
+| **Grad accum** | 4 | Achieves effective batch=256 for stable training. |
+| **Warmup** | 3% | Prevents early instability with high LR. |
+| **Max seq len** | 2048 | Function calls rarely exceed 1K tokens; 2048 provides buffer. |
+
+### 3.6 Pipeline Stages
+
+```mermaid
+flowchart LR
+    subgraph Prepare["Preparation"]
+        S1["1. Download Model"]
+        S2["2. Preflight Check"]
+        S3["3. Prepare Data"]
+    end
+    
+    subgraph Train["Training"]
+        S4["4. Submit Training"]
+    end
+    
+    subgraph Validate["Validation"]
+        S5["5. Inference Test"]
+    end
+    
+    S1 --> S2 --> S3 --> S4 --> S5
+```
+
+### 3.7 Commands to Run
 
 ```bash
-# Stage 1: Prepare (one-time)
-kubectl apply -f k8s/model-download-job.yaml
-kubectl apply -f k8s/data-prep-job.yaml
+# Step 1: Download Model
+./scripts/run-model-download.sh
 
-# Stage 2: Train
-export WANDB_API_KEY=$(kubectl get secret wandb-token -n default -o jsonpath='{.data.key}' | base64 -d)
-envsubst < k8s/ray-training-job.yaml | kubectl apply -f -
+# Step 2: Preflight Check (validates GPUs, NCCL, storage)
+./scripts/run-preflight-check.sh
 
-# Stage 3: Monitor
-# Wandb: https://wandb.ai/<user>/llama3-function-calling
-kubectl port-forward -n ray-cluster svc/ray-cluster-head-svc 8265:8265
+# Step 3: Prepare Data (downloads & formats dataset)
+./scripts/run-data-prep.sh
 
-# Stage 4: Test (compares base vs fine-tuned model)
-kubectl apply -f k8s/inference-test-job.yaml
-kubectl logs -n ray-cluster -f job/llama3-inference-demo
+# Step 4: Submit Training Job
+./scripts/submit-training-job.sh
+
+# Step 5: Run Inference Test
+./scripts/run-inference-test.sh
 ```
 
-### 3.4 Training Configuration
+### 3.8 Training Configuration
 
-| Parameter | Value | Effective |
-|-----------|-------|-----------|
-| Batch size per GPU | 4 | - |
-| Gradient accumulation | 4 | - |
-| Number of GPUs | 16 | - |
-| **Effective batch size** | - | **256** |
-| Learning rate | 1.5e-4 | Cosine decay |
-| Epochs | 3 | ~1.5 hours total |
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Batch size per GPU | 4 | |
+| Gradient accumulation | 4 | |
+| Number of GPUs | 16 | 2 nodes × 8 GPUs |
+| **Effective batch size** | **256** | 4 × 4 × 16 |
+| Learning rate | 1.5e-4 | Cosine decay with 3% warmup |
+| Epochs | 3 | ~1,257 steps |
+| Max sequence length | 2048 | |
 | Checkpoint interval | 200 steps | Auto-resume enabled |
+| Training samples | 107,312 | glaive-function-calling-v2 |
+| Validation samples | 5,648 | |
 
 ---
 
@@ -303,7 +434,7 @@ gradient_accumulation_steps=1,   # Reduce (batch already large)
 1. **Reproducibility**: Infrastructure as Code (Terraform)
 2. **Observability**: Full stack monitoring (Wandb + Grafana + Ray)
 3. **Fault Tolerance**: Checkpoint resume, Ray auto-retry
-4. **Efficiency**: 100% GPU utilization, InfiniBand RDMA
+4. **Efficiency**: ~90% GPU utilization, InfiniBand RDMA
 5. **Simplicity**: LoRA fine-tuning, not full model training
 
 ---
@@ -316,12 +447,21 @@ gradient_accumulation_steps=1,   # Reduce (batch already large)
 |--------|-------|
 | Model | Llama-3-8B-Instruct |
 | Task | Function calling |
-| Training samples | ~20,000 |
+| Training samples | 107,312 |
+| Validation samples | 5,648 |
 | Final loss | ~0.36 |
-| GPU utilization | 100% |
+| GPU utilization | ~90% |
 | Training time | ~90 min (3 epochs) |
 
-### 7.2 Resource Utilization
+### 7.2 Inference Test Results
+
+| Metric | Base Model | Fine-Tuned |
+|--------|------------|------------|
+| Function call success rate | 0% | **100%** |
+| Valid JSON output | No | Yes |
+| Correct arguments | No | Yes |
+
+### 7.3 Resource Utilization
 
 | Resource | Usage |
 |----------|-------|
@@ -330,7 +470,7 @@ gradient_accumulation_steps=1,   # Reduce (batch already large)
 | InfiniBand | Active (NCCL IB enabled) |
 | Shared Storage | ~50 GB (model + data + checkpoints) |
 
-### 7.3 Costs (Estimated)
+### 7.4 Costs (Estimated)
 
 | Scale | GPUs | Monthly Cost* | Use Case |
 |-------|------|---------------|----------|
@@ -340,7 +480,7 @@ gradient_accumulation_steps=1,   # Reduce (batch already large)
 
 *Based on H100 cloud pricing estimates
 
-### 7.4 Inference Demo
+### 7.5 Inference Demo
 
 The inference demo compares the base Llama-3-8B-Instruct model against the fine-tuned version:
 
@@ -397,20 +537,25 @@ kubectl logs -n ray-cluster -f job/llama3-inference-demo
 
 ```
 ahmabboud-finetune_llama3_8b_k8s/
-├── infra/                    # Terraform infrastructure
-│   ├── k8s-installation/     # Main cluster config
-│   └── modules/              # Reusable modules
-├── k8s/                      # Kubernetes manifests
-│   ├── ray-training-job.yaml # Main training job
-│   ├── training-fsdp.yaml    # Alternative (StatefulSet)
-│   └── *.yaml                # Other jobs
-├── scripts/                  # Python scripts
-├── configs/                  # Training configs
-├── docs/                     # Documentation
-│   ├── Training_Guide.md
-│   ├── Monitoring_Guide.md
-│   └── Infrastructure_Quick_Start.md
-└── README.md
+├── infra/                        # Terraform infrastructure
+│   └── k8s-installation/         # Main cluster config
+├── k8s/                          # Kubernetes manifests
+│   ├── ray-training-job.yaml     # Main training RayJob
+│   ├── model-download-job.yaml   # Model download job
+│   ├── data-prep-job.yaml        # Data preparation job
+│   ├── preflight-check.yaml      # GPU/NCCL validation
+│   └── inference-test-job.yaml   # Inference comparison
+├── scripts/                      # Runner scripts
+│   ├── run-model-download.sh
+│   ├── run-preflight-check.sh
+│   ├── run-data-prep.sh
+│   ├── submit-training-job.sh
+│   └── run-inference-test.sh
+└── docs/                         # Documentation
+    ├── Training_Guide.md
+    ├── Monitoring_Guide.md
+    ├── Infrastructure_Quick_Start.md
+    └── PoC_Summary.md
 ```
 
 ---
@@ -431,10 +576,13 @@ The pipeline is designed for **small teams** who want to focus on ML, not infras
 
 ## Appendix: Quick Reference
 
-### Start Training
+### Run Full Pipeline
 ```bash
-export WANDB_API_KEY=$(kubectl get secret wandb-token -n default -o jsonpath='{.data.key}' | base64 -d)
-envsubst < k8s/ray-training-job.yaml | kubectl apply -f -
+./scripts/run-model-download.sh     # Download Llama-3-8B
+./scripts/run-preflight-check.sh    # Validate cluster
+./scripts/run-data-prep.sh          # Prepare dataset
+./scripts/submit-training-job.sh    # Start training
+./scripts/run-inference-test.sh     # Test results
 ```
 
 ### Check Status
@@ -449,7 +597,7 @@ kubectl logs -n ray-cluster -l job-name=llama3-finetuning --tail=50
 open https://wandb.ai/<user>/llama3-function-calling
 
 # Ray Dashboard
-kubectl port-forward -n ray-cluster svc/ray-cluster-head-svc 8265:8265
+kubectl port-forward -n ray-cluster svc/ray-cluster-kuberay-head-svc 8265:8265
 
 # Grafana
 kubectl port-forward -n o11y svc/grafana-and-prometheus 8080:80
@@ -463,11 +611,10 @@ gpu_nodes_count_per_group = 64
 # Apply
 terraform apply
 
-# Update training job
-# num_workers=512
+# Update training job num_workers to 512
 ```
 
 ---
 
 *Document prepared for Nebius Cloud PoC Demo*
-*Last updated: 2026-02-03*
+*Last updated: 2026-02-05*

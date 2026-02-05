@@ -166,14 +166,14 @@ data:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "right"
         
-        # Load model - let FSDP handle placement
+        # Load model
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME,
             torch_dtype=torch.bfloat16,
             use_cache=False,  # Required for gradient checkpointing
         )
         
-        # Apply LoRA before FSDP wrapping
+        # Apply LoRA
         model = get_peft_model(model, LORA_CONFIG)
         model.enable_input_require_grads()
         
@@ -215,7 +215,7 @@ data:
         train_data = train_data.map(tokenize_function, batched=True, load_from_cache_file=False, remove_columns=["text"])
         val_data = val_data.map(tokenize_function, batched=True, load_from_cache_file=False, remove_columns=["text"])
         
-        # Training arguments with DDP (FSDP requires multi-GPU per process)
+        # Training arguments with DDP
         training_args = TrainingArguments(
             output_dir=OUTPUT_DIR,
             num_train_epochs=3,

@@ -26,7 +26,8 @@ kubectl port-forward -n ray-cluster svc/ray-cluster-head-svc 8265:8265
 
 # Grafana
 kubectl port-forward -n o11y svc/grafana-and-prometheus 8080:80
-# Open http://localhost:8080 (admin / check .env for password)
+# Open http://localhost:8080
+# Login: admin / run `terraform output -raw grafana_password` in infra/k8s-installation/
 
 # Prometheus (direct access)
 kubectl port-forward -n o11y svc/prometheus-server 9090:80
@@ -185,7 +186,7 @@ Grafana provides infrastructure visibility:
 ```bash
 kubectl port-forward -n o11y svc/grafana-and-prometheus 8080:80
 # Open http://localhost:8080
-# Login: admin / (password in .env or 'admin' by default)
+# Login: admin / run `terraform output -raw grafana_password` in infra/k8s-installation/
 ```
 
 ### Pre-configured Dashboards

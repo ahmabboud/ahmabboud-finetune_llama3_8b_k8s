@@ -4,6 +4,84 @@ This guide covers how to deploy, manage, and debug the K8s training cluster on N
 
 ---
 
+## Architecture Overview
+
+### Infrastructure
+
+```mermaid
+flowchart TB
+    subgraph Nebius["Nebius Cloud (eu-north1)"]
+        subgraph K8s["Kubernetes Cluster"]
+            API[API Server]
+            
+            subgraph Node1["GPU Node 1"]
+                GPU1["8x H100 80GB<br/>NVLink"]
+                IB1["InfiniBand NIC"]
+            end
+            
+            subgraph Node2["GPU Node 2"]
+                GPU2["8x H100 80GB<br/>NVLink"]
+                IB2["InfiniBand NIC"]
+            end
+        end
+        
+        FS["Filestore NFS (2TB)"]
+        
+        subgraph Fabric["InfiniBand Fabric"]
+            IB["400 Gb/s RDMA"]
+        end
+    end
+    
+    Local["Local: kubectl / Terraform"]
+    
+    Local --> API
+    API --> Node1
+    API --> Node2
+    IB1 <--> IB
+    IB2 <--> IB
+    Node1 -.->|mount| FS
+    Node2 -.->|mount| FS
+```
+
+### Kubernetes Namespaces
+
+```mermaid
+flowchart LR
+    subgraph ray["ray-cluster"]
+        Head["Ray Head"]
+        W1["GPU Worker 1<br/>8x H100"]
+        W2["GPU Worker 2<br/>8x H100"]
+        Head --> W1
+        Head --> W2
+    end
+    
+    subgraph o11y["o11y"]
+        Grafana
+        Prometheus
+    end
+    
+    subgraph nvidia["nvidia-device-plugin"]
+        DCGM["DCGM Exporter"]
+    end
+    
+    Prometheus --> DCGM
+    Prometheus --> W1
+    Prometheus --> W2
+```
+
+### Component Summary
+
+| Component | Specification | Purpose |
+|-----------|---------------|---------|
+| **GPU Nodes** | 2x `gpu-h100-sxm` (8 GPU each) | Training compute |
+| **GPUs** | 16x NVIDIA H100 80GB SXM | Tensor operations |
+| **Interconnect** | InfiniBand 400Gb/s | NCCL multi-node |
+| **Storage** | Filestore NFS 2TB | Models, data, checkpoints |
+| **Ray Cluster** | KubeRay 2.46.0 | Distributed training orchestration |
+| **Monitoring** | Grafana + Prometheus + DCGM | GPU/cluster metrics |
+
+---
+
 ## Prerequisites
 
 ### Required Tools
