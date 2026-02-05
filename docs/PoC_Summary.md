@@ -47,22 +47,62 @@ This document summarizes the Proof-of-Concept (PoC) for multi-node LLM fine-tuni
 
 ### 1.3 Storage Architecture
 
-| Storage Type | Size | Mount Point | Purpose |
-|--------------|------|-------------|---------|
-| **Shared Filesystem** | 2 TB | `/mnt/data` | Models, datasets, checkpoints |
-| **Node Boot Disk** | 1 TB SSD | `/` | OS, container images |
+| Storage Type | PoC Size | Production Size | Mount Point | Purpose |
+|--------------|----------|-----------------|-------------|---------|
+| **Shared Filesystem (NFS)** | 2 TB | 32 TB | `/mnt/data` | Models, datasets, checkpoints |
+| **Node Boot Disk (SSD)** | 1 TB | 1 TB | `/` | OS, container images |
 
-**Why NFS Shared Storage (not Object Storage)?**
+#### Why These Storage Types?
 
-| Factor | NFS (Filestore) | S3/Object Storage |
-|--------|-----------------|-------------------|
-| **Access pattern** | POSIX filesystem | API calls |
-| **PyTorch compatibility** | Native `torch.load()` | Requires streaming |
-| **Checkpoint speed** | Fast (local-like) | Slow (upload/download) |
-| **Multi-node access** | Simultaneous RW | Complex locking |
-| **HuggingFace cache** | Works natively | Requires custom code |
+**Shared Filesystem (NFS) - `/mnt/data`:**
+- **Throughput**: ~1-2 GB/s sequential read/write (sufficient for model loading and checkpoint saving)
+- **Cross-node access**: All GPU workers read the same model weights and datasets without copying data to each node
+- **Checkpoint persistence**: Training checkpoints survive pod restarts and node failures, enabling auto-resume
+- **POSIX compatibility**: PyTorch's `torch.load()` and HuggingFace caching require standard filesystem semantics (not object storage)
+- **Managed service**: Nebius Filestore handles replication and availability with zero operational overhead
 
-**Decision:** NFS provides POSIX semantics that PyTorch and HuggingFace expect. All workers can read the model and write checkpoints without coordination.
+**Node Boot Disk (SSD) - `/`:**
+- **Throughput**: ~3-5 GB/s sequential, ~500K IOPS random read/write
+- **Low latency**: ~0.1ms access time vs ~1-5ms for NFS — critical for OS and container operations
+- **Node isolation**: Each node has independent storage, preventing cross-node failures from affecting boot
+- **Ephemeral data**: Temporary files, logs, and caches that don't need cross-node sharing or persistence
+
+#### Why 32 TB for Production (64 Nodes)?
+
+**PoC storage usage (~50 GB):**
+| Component | Size | Scales with Nodes? |
+|-----------|------|-------------------|
+| Base Model (Llama-3-8B) | 16 GB | No |
+| Dataset | ~5 GB | No |
+| Checkpoints (LoRA, ~6 saves) | ~6 GB | No (only rank 0 saves) |
+| HuggingFace cache | ~2 GB | No (shared) |
+| Logs/artifacts | ~5 GB | Slightly |
+
+**Why 2 TB is not enough at 64 nodes:**
+
+1. **Concurrent experiments**: Production teams run 3-5 experiments simultaneously (~250 GB)
+2. **Checkpoint history**: 30 days of checkpoints for comparison and rollback (~200 GB)
+3. **Larger models**: Testing 70B models requires ~140 GB per model version
+4. **Multiple model versions**: Merged LoRA adapters for A/B testing (~200 GB)
+5. **Larger datasets**: Production datasets often 10-50x larger (~500 GB)
+6. **Team collaboration**: Multiple engineers running concurrent jobs
+7. **Headroom**: 50% buffer for unexpected growth
+
+**Production storage estimate:**
+```
+Concurrent experiments:     ~250 GB
+Checkpoint history (30d):   ~200 GB
+70B model testing:          ~150 GB
+Model versions:             ~200 GB
+Larger datasets:            ~500 GB
+Headroom (50%):             ~650 GB
+─────────────────────────────────────
+Minimum recommended:        ~2 TB
+With growth buffer:         ~8-16 TB
+Production (comfortable):   32 TB
+```
+
+**32 TB provides**: Room for multiple large models, extensive checkpoint history, concurrent team usage, and future dataset growth without operational interruptions
 
 ### 1.4 Network Configuration
 
@@ -102,6 +142,21 @@ terraform init && terraform apply
 # ~15 minutes to provision
 ```
 
+#### Why Kubernetes + KubeRay?
+
+**Kubernetes:**
+- **Managed service**: Nebius provides fully managed K8s, eliminating cluster operations burden
+- **Native GPU scheduling**: Device plugin handles GPU allocation automatically
+- **Auto-healing**: Failed pods restart automatically without manual intervention
+- **Built-in monitoring**: Prometheus and Grafana integrate natively
+- **Multi-tenancy**: Namespaces and quotas enable team collaboration
+
+**KubeRay:**
+- **ML-friendly API**: Ray Train provides simple Python APIs for distributed training
+- **Fault tolerance**: Automatic worker recovery and checkpoint resume
+- **K8s-native**: Runs as a CRD, integrating with K8s scheduling and networking
+- **Unified platform**: Same framework for training, tuning, and serving
+
 ### 2.2 Installed Frameworks
 
 | Framework | Purpose | Namespace |
@@ -123,6 +178,18 @@ terraform init && terraform apply
 | **TRL** | 0.11.4 | SFTTrainer for instruction tuning |
 | **Ray Train** | 2.46.0 | Distributed training orchestration |
 | **Datasets** | 3.2.0 | Data loading and processing |
+
+#### Why This Training Framework Stack?
+
+**PyTorch:** Industry standard for LLM development. HuggingFace Transformers and Llama models are PyTorch-native with the largest community support.
+
+**Transformers:** Provides model loading, tokenization, and training utilities. First-class support for Llama-3 with active development.
+
+**PEFT/LoRA:** Enables memory-efficient fine-tuning by training only ~1% of parameters while preserving base model capabilities.
+
+**TRL SFTTrainer:** Purpose-built for instruction tuning. Handles chat templates and integrates seamlessly with PEFT.
+
+**Ray Train:** Provides fault-tolerant distributed training with native KubeRay integration. Automatic checkpoint management and worker recovery.
 
 ### 2.4 Why Llama-3-8B-Instruct?
 
