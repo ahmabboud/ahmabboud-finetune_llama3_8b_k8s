@@ -38,16 +38,88 @@ spec:
               mkdir -p /mnt/data/datasets
               mkdir -p /mnt/data/cache
               
-              echo "Copying source code..."
-              cd /mnt/data/app
-              
               echo "Running data preparation..."
-              python scripts/prepare_data.py \
-                --dataset glaiveai/glaive-function-calling-v2 \
-                --format glaive \
-                --output-dir /mnt/data/datasets \
-                --cache-dir /mnt/data/cache \
-                --train-ratio 0.95
+              python3 << 'PYTHON_SCRIPT'
+              import argparse
+              import sys
+              from pathlib import Path
+              
+              # Add project root to path
+              sys.path.insert(0, "/mnt/data/app")
+              
+              from src.data import load_xlam_dataset, preprocess_for_training
+              from src.data.dataset import load_glaive_dataset, save_dataset
+              from src.data.preprocessing import split_dataset, preprocess_glaive_dataset
+              
+              # Parse arguments
+              dataset = "glaiveai/glaive-function-calling-v2"
+              format_type = "glaive"
+              output_dir = Path("/mnt/data/datasets")
+              cache_dir = Path("/mnt/data/cache")
+              train_ratio = 0.95
+              seed = 42
+              
+              output_dir.mkdir(parents=True, exist_ok=True)
+              
+              print("=" * 50)
+              print("Data Preparation Pipeline")
+              print("=" * 50)
+              print(f"Dataset: {dataset}")
+              print(f"Format: {format_type}")
+              
+              # Step 1: Load raw dataset
+              print("\n[1/4] Loading dataset...")
+              if format_type == "glaive":
+                  raw_data = load_glaive_dataset(
+                      dataset_name=dataset,
+                      cache_dir=str(cache_dir),
+                      max_samples=None,
+                  )
+              else:
+                  raw_data = load_xlam_dataset(
+                      dataset_name=dataset,
+                      cache_dir=str(cache_dir),
+                  )
+              
+              # Step 2: Preprocess
+              print("\n[2/4] Preprocessing data...")
+              if format_type == "glaive":
+                  processed_data = preprocess_glaive_dataset(
+                      raw_data,
+                      verbose=True,
+                  )
+              else:
+                  processed_data = preprocess_for_training(
+                      raw_data,
+                      max_tools=10,
+                      verbose=True,
+                  )
+              
+              # Step 3: Split
+              print("\n[3/4] Splitting dataset...")
+              train_data, val_data = split_dataset(
+                  processed_data,
+                  train_ratio=train_ratio,
+                  seed=seed,
+              )
+              
+              # Step 4: Save
+              print("\n[4/4] Saving processed data...")
+              save_dataset(train_data, output_dir / "train.jsonl")
+              save_dataset(val_data, output_dir / "val.jsonl")
+              
+              # Summary
+              print("\n" + "=" * 50)
+              print("Data preparation complete!")
+              print("=" * 50)
+              print(f"Total examples: {len(processed_data)}")
+              print(f"Training examples: {len(train_data)}")
+              print(f"Validation examples: {len(val_data)}")
+              print(f"Output directory: {output_dir}")
+              print(f"Files created:")
+              print(f"  - {output_dir / 'train.jsonl'}")
+              print(f"  - {output_dir / 'val.jsonl'}")
+              PYTHON_SCRIPT
               
               echo "Data preparation complete!"
               ls -la /mnt/data/datasets/
