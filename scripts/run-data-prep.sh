@@ -47,7 +47,7 @@ echo ""
 echo "Waiting for job to complete..."
 kubectl wait --for=condition=complete --timeout=600s "job/$JOB_NAME" -n "$NAMESPACE" 2>/dev/null && {
     echo ""
-    echo "✅ Data preparation completed successfully!"
+    echo "Data preparation completed successfully!"
     echo ""
     echo "Data is available at: /mnt/data/datasets/"
     echo "  - train.jsonl"
@@ -59,11 +59,11 @@ kubectl wait --for=condition=complete --timeout=600s "job/$JOB_NAME" -n "$NAMESP
 JOB_FAILED=$(kubectl get job "$JOB_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)
 if [ "$JOB_FAILED" = "True" ]; then
     echo ""
-    echo "❌ Data preparation failed."
+    echo "Data preparation failed."
     exit 1
 fi
 
 echo ""
-echo "⚠️  Job status unknown. Check manually with:"
+echo " Job status unknown. Check manually with:"
 echo "    kubectl get job $JOB_NAME -n $NAMESPACE"
 exit 1

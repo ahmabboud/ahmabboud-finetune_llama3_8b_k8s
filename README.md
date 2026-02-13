@@ -109,6 +109,4 @@ Fine-tuned model achieves **100% success rate** on function calling tests vs **0
 - [Training Guide](docs/Training_Guide.md)
 - [Monitoring Guide](docs/Monitoring_Guide.md)
 
-## License
 
-MIT

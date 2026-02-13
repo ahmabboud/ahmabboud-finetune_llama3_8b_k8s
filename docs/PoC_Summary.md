@@ -42,8 +42,14 @@ This document summarizes the Proof-of-Concept (PoC) for multi-node LLM fine-tuni
 | **GPUs Total** | 16x H100 80GB | 512x H100 80GB |
 | **GPU per Node** | 8 | 8 |
 | **CPU Nodes** | 2 | 4-8 |
-| **Shared Storage** | 2 TB | 32 TB |
+| **Shared Storage** | 2 TB | 8 TB |
 | **Interconnect** | InfiniBand 400Gb/s | InfiniBand 400Gb/s |
+
+**Note on Storage Scaling**: Storage does NOT scale linearly with GPU count because:
+- Only rank 0 saves checkpoints (not all 512 workers)
+- Dataset caching is disabled (`load_from_cache_file=False`)
+- Model and datasets are shared (not duplicated per worker)
+- Only logs scale with worker count (~3 GB for 512 workers vs ~100 MB for 16 workers)
 
 ### 1.3 Storage Architecture
 
@@ -358,13 +364,18 @@ Pre-configured alerts available for:
 
 ### 5.1 What Changes
 
-| Component | 16 GPUs (PoC) | 512 GPUs | File |
-|-----------|---------------|----------|------|
-| `gpu_max_nodes` | 2 | 64 | terraform.tfvars |
-| `gpu_nodes_count_per_group` | 2 | 64 | terraform.tfvars |
-| `num_workers` | 16 | 512 | ray-training-job.yaml |
-| `learning_rate` | 1.5e-4 | 5e-4 | ray-training-job.yaml |
-| `gradient_accumulation_steps` | 4 | 1 | ray-training-job.yaml |
+| Component | 16 GPUs (PoC) | 512 GPUs | File | Why |
+|-----------|---------------|----------|------|-----|
+| `gpu_max_nodes` | 2 | 64 | terraform.tfvars | Provision 64 nodes |
+| `gpu_nodes_count_per_group` | 2 | 64 | terraform.tfvars | Scale node group |
+| `shared_storage_size` | 2 TB | 8 TB | terraform.tfvars | More experiments, logs (not linear: only rank 0 saves) |
+| `num_workers` | 16 | 512 | ray-training-job.yaml | 1 worker per GPU |
+| `per_device_train_batch_size` | 4 | 4 (no change) | ray-training-job.yaml | Already optimized for H100 memory (~50GB), keep same |
+| `gradient_accumulation_steps` | 4 | 1 | ray-training-job.yaml | 512 GPUs provide enough parallelism, no accumulation needed |
+| `learning_rate` | 1.5e-4 | 5e-4 | ray-training-job.yaml | Larger batch needs higher LR (Goyal etal 2017)|
+| `save_strategy` | "steps" | "epoch" | ray-training-job.yaml | Steps drop 8× (1257→157), epoch-based safer |
+| `save_steps` | 200 | (remove) | ray-training-job.yaml | Not needed with epoch strategy |
+| **Effective batch** | **256** | **2,048** | (calculated) | **4 × 4 × 16 → 4 × 1 × 512** |
 
 ### 5.2 Scaling Commands
 
@@ -378,7 +389,7 @@ gpu_nodes_count_per_group = 64
 **Step 2: Apply Infrastructure**
 ```bash
 cd infra/k8s-installation
-terraform apply  # ~45-60 min for 64 nodes
+terraform apply  
 ```
 
 **Step 3: Update Training Job**
@@ -393,6 +404,11 @@ scaling_config=ScalingConfig(
 learning_rate=5e-4,
 gradient_accumulation_steps=1,
 # New effective batch: 4 × 1 × 512 = 2048
+
+# Checkpoint strategy
+save_strategy="epoch",      # Changed from "steps"
+# Remove: save_steps=200    # Not needed with epoch strategy
+eval_strategy="epoch",      # Also change eval to match
 ```
 
 ### 5.3 Scaling Performance
@@ -402,7 +418,7 @@ gradient_accumulation_steps=1,
 | 16 | 2 | 256 | ~90 min | 1× |
 | 64 | 8 | 1024 | ~25 min | 3.6× |
 | 256 | 32 | 4096 | ~8 min | 11× |
-| 512 | 64 | 8192 | ~5 min | 18× |
+| 512 | 64 | 8192 | ~5 min | 18×-22x |
 
 *Note: Sub-linear scaling at 512 GPUs due to increased communication overhead. Near-linear up to ~256 GPUs with InfiniBand.*
 
@@ -469,15 +485,7 @@ gradient_accumulation_steps=1,
 | InfiniBand | Active (NCCL IB enabled) |
 | Shared Storage | ~50 GB (model + data + checkpoints) |
 
-### 7.4 Costs (Estimated)
 
-| Scale | GPUs | Monthly Cost* | Use Case |
-|-------|------|---------------|----------|
-| PoC | 16 | ~$15,000 | Experimentation |
-| Small | 64 | ~$60,000 | Regular fine-tuning |
-| Large | 512 | ~$480,000 | Production training |
-
-*Based on H100 cloud pricing estimates
 
 ### 7.5 Inference Demo
 

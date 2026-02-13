@@ -64,6 +64,7 @@ resource "time_static" "restarted_at" {}
 resource "kubernetes_annotations" "restart_grafana" {
   api_version = "apps/v1"
   kind        = "Deployment"
+  force       = true  # Allow overriding other field managers
   metadata {
     name      = "grafana-and-prometheus"
     namespace = var.namespace

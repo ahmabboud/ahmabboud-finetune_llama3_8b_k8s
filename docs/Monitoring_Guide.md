@@ -10,9 +10,22 @@ This project includes multiple monitoring tools, each serving a specific purpose
 |------|---------|---------|--------|
 | **Wandb** | Training metrics visualization | Loss, LR, grad norm, epoch | https://wandb.ai |
 | **Ray Dashboard** | Job management & logs | Job status, workers, resources | localhost:8265 |
-| **Grafana** | Infrastructure metrics | GPU temp, power, utilization | localhost:8080 |
+| **Ray Grafana** | Ray-specific metrics | Ray jobs, autoscaler, tasks | localhost:3000 |
+| **Cluster Grafana** | Infrastructure metrics | GPU temp, power, utilization | localhost:8080 |
 | **Prometheus** | Metrics collection & storage | All infrastructure metrics | localhost:9090 |
 | **NVIDIA DCGM** | GPU health & performance | Detailed GPU metrics | Via Prometheus/Grafana |
+
+### Note: Two Grafana Instances
+
+This setup includes **two separate Grafana instances**:
+
+1. **Ray Grafana** (`ray-cluster` namespace) - Monitors Ray cluster specifically
+   - Use when: Debugging Ray jobs, checking autoscaler behavior
+   - Embedded in Ray Dashboard at http://localhost:8265
+   
+2. **Cluster Grafana** (`o11y` namespace) - Monitors entire cluster infrastructure  
+   - Use when: Checking GPU utilization, temperatures, cluster-wide metrics
+   - General infrastructure monitoring at http://localhost:8080
 
 ## Quick Access Commands
 
@@ -24,7 +37,12 @@ This project includes multiple monitoring tools, each serving a specific purpose
 kubectl port-forward -n ray-cluster svc/ray-cluster-head-svc 8265:8265
 # Open http://localhost:8265
 
-# Grafana
+# Ray Grafana (embedded in Ray Dashboard)
+kubectl port-forward -n ray-cluster svc/ray-cluster-grafana 3000:80
+# Open http://localhost:3000
+# Login: admin / prom-operator
+
+# Cluster Grafana (infrastructure monitoring)
 kubectl port-forward -n o11y svc/grafana-and-prometheus 8080:80
 # Open http://localhost:8080
 # Login: admin / run `terraform output -raw grafana_password` in infra/k8s-installation/
@@ -165,37 +183,81 @@ kubectl describe pod -n ray-cluster <gpu-worker-pod>
 
 ---
 
-## 3. Grafana
+## 3. Grafana (Two Instances)
 
-### What It Monitors
+This project has **two separate Grafana instances** for different monitoring purposes.
+
+### 3.1 Ray Grafana (Ray-Specific Monitoring)
+
+**Purpose**: Monitor Ray cluster components and jobs
+
+**What It Monitors**:
+- **Ray autoscaler** - Scaling events, node counts
+- **Ray job metrics** - Task execution, actor lifecycle
+- **Ray worker metrics** - Worker health, resource usage
+- **Prometheus metrics** - Ray-specific Prometheus data
+
+**Why Use It**:
+- Embedded in Ray Dashboard for integrated view
+- Pre-configured with Ray-specific dashboards
+- Shows Ray autoscaler behavior (scale-to-zero)
+- Tracks Ray job execution details
+
+**Access**:
+```bash
+# Ray Dashboard embeds Grafana, so you need BOTH port-forwards:
+
+# Terminal 1: Ray Dashboard
+kubectl port-forward -n ray-cluster svc/ray-cluster-head-svc 8265:8265
+
+# Terminal 2: Ray Grafana (required for dashboard embedding)
+kubectl port-forward -n ray-cluster svc/ray-cluster-grafana 3000:80
+
+# Open http://localhost:8265 (Ray Dashboard with embedded Grafana)
+# OR directly: http://localhost:3000 (Ray Grafana standalone)
+# Login: admin / prom-operator
+```
+
+**Pre-configured Dashboards**:
+- Ray cluster overview
+- Ray autoscaler metrics
+- Kubernetes cluster metrics
+
+---
+
+### 3.2 Cluster Grafana (Infrastructure Monitoring)
+
+**Purpose**: Monitor entire Kubernetes cluster infrastructure
+
+**What It Monitors**:
 - **GPU utilization** - SM (compute) activity percentage
 - **GPU memory** - Used vs total VRAM
 - **GPU temperature** - Thermal status
 - **GPU power** - Power draw in watts
 - **Node metrics** - CPU, RAM, disk, network
+- **Loki logs** - Centralized cluster logs
 
-### Why Use It
-Grafana provides infrastructure visibility:
-- Verify GPUs are being utilized
-- Detect thermal throttling
-- Monitor memory pressure
-- Track system health over time
+**Why Use It**:
+- General cluster-wide visibility
+- GPU health monitoring for all nodes
+- Infrastructure bottleneck detection
+- Historical metrics over time
 
-### Access
-
+**Access**:
 ```bash
 kubectl port-forward -n o11y svc/grafana-and-prometheus 8080:80
 # Open http://localhost:8080
 # Login: admin / run `terraform output -raw grafana_password` in infra/k8s-installation/
 ```
 
-### Pre-configured Dashboards
+**Pre-configured Dashboards**:
 
 | Dashboard | Metrics |
 |-----------|---------|
 | **NVIDIA DCGM Exporter** | GPU utilization, memory, temp, power |
 | **Node Exporter** | CPU, RAM, disk, network |
 | **Kubernetes / Compute Resources** | Pod resource usage |
+| **Loki Logs** | Centralized log viewing |
 
 ### Key Metrics to Watch
 
@@ -316,19 +378,19 @@ kubectl logs -n nvidia-device-plugin -l app=nvidia-dcgm-exporter --tail=50
 ### What It Monitors
 DCGM provides detailed GPU metrics:
 
-| Metric | Description |
-|--------|-------------|
-| `DCGM_FI_DEV_GPU_UTIL` | GPU compute utilization % |
-| `DCGM_FI_DEV_MEM_COPY_UTIL` | Memory controller utilization % |
-| `DCGM_FI_DEV_FB_USED` | Framebuffer (VRAM) used in MB |
-| `DCGM_FI_DEV_FB_FREE` | Framebuffer free in MB |
-| `DCGM_FI_DEV_GPU_TEMP` | GPU temperature in Celsius |
-| `DCGM_FI_DEV_POWER_USAGE` | Power draw in Watts |
-| `DCGM_FI_DEV_SM_CLOCK` | SM clock frequency in MHz |
-| `DCGM_FI_DEV_MEM_CLOCK` | Memory clock frequency in MHz |
-| `DCGM_FI_DEV_PCIE_TX_THROUGHPUT` | PCIe TX bandwidth |
-| `DCGM_FI_DEV_PCIE_RX_THROUGHPUT` | PCIe RX bandwidth |
-| `DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL` | NVLink bandwidth |
+| Metric | Description | Low Value = Check | High Value = Check |
+|--------|-------------|-------------------|-------------------|
+| `DCGM_FI_DEV_GPU_UTIL` | GPU compute utilization % | Batch size too small, data loading bottleneck, CPU preprocessing slow | - |
+| `DCGM_FI_DEV_MEM_COPY_UTIL` | Memory controller utilization % | Memory access pattern, cache misses | Memory bandwidth bottleneck |
+| `DCGM_FI_DEV_FB_USED` | Framebuffer (VRAM) used in MB | Batch size too small, model not loaded | Batch size too large, risk of OOM |
+| `DCGM_FI_DEV_FB_FREE` | Framebuffer free in MB | Increase batch size for better utilization | Reduce batch size, enable gradient checkpointing |
+| `DCGM_FI_DEV_GPU_TEMP` | GPU temperature in Celsius | Normal at idle | Cooling issues, high ambient temp, reduce workload |
+| `DCGM_FI_DEV_POWER_USAGE` | Power draw in Watts | GPU idle or underutilized | Normal under load, check if throttling |
+| `DCGM_FI_DEV_SM_CLOCK` | SM clock frequency in MHz | Thermal throttling, power throttling | - |
+| `DCGM_FI_DEV_MEM_CLOCK` | Memory clock frequency in MHz | Thermal throttling, power throttling | - |
+| `DCGM_FI_DEV_PCIE_TX_THROUGHPUT` | PCIe TX bandwidth | Model/data not on GPU, check data loading | Normal for model loading, data transfer |
+| `DCGM_FI_DEV_PCIE_RX_THROUGHPUT` | PCIe RX bandwidth | Minimal GPU→CPU transfer expected | Check if unnecessary data movement |
+| `DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL` | NVLink bandwidth | No inter-GPU communication (DDP issue) | Normal for DDP gradient sync |
 
 ### Why Use It
 DCGM metrics help diagnose:

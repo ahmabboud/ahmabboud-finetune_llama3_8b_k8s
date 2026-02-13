@@ -20,39 +20,47 @@
 #   kubectl logs -n ray-cluster -l job-name=llama3-finetuning -f
 ###############################################################################
 apiVersion: ray.io/v1
-kind: RayJob
+kind: RayJob  # Ray's custom resource for submitting jobs to existing Ray cluster
 metadata:
   name: llama3-finetuning
   namespace: ray-cluster
 spec:
-  # Automatically delete job after completion
+  # Automatically delete job after completion (7200s = 2 hours)
+  # Gives time to inspect logs/results before cleanup
+
   ttlSecondsAfterFinished: 7200
-  shutdownAfterJobFinishes: true
+  shutdownAfterJobFinishes: true    # Stop Ray workers after job completes (save resources)
   
   # Job entrypoint - run training script from shared filesystem
+  # Script copied to NFS by the copy-ray-script job below
+
   entrypoint: "python /mnt/data/ray-train.py"
   
-  # Runtime environment
+  # Runtime environment - packages and env vars for all Ray workers
+
   runtimeEnvYAML: |
     env_vars:
-      HF_HOME: "/mnt/data/cache/huggingface"
-      NCCL_DEBUG: "INFO"
-      NCCL_IB_DISABLE: "0"
-      NCCL_NET_GDR_LEVEL: "2"
-      WANDB_PROJECT: "llama3-function-calling"
-      WANDB_RUN_NAME: "ray-h100-16x-lora"
-      WANDB_API_KEY: "${WANDB_API_KEY}"
-    pip:
-      - torch==2.5.1
-      - transformers==4.46.3
-      - peft==0.13.2
-      - accelerate==1.1.1
-      - trl==0.11.4
-      - datasets
-      - bitsandbytes
-      - wandb
+      HF_HOME: "/mnt/data/cache/huggingface"    # Cache dir for model/tokenizer downloads
+      NCCL_DEBUG: "INFO"    # Enable NCCL logging (see inter-node communication details)
+      NCCL_IB_DISABLE: "0"    # 0 = Enable InfiniBand (400 Gb/s inter-node)
+      NCCL_NET_GDR_LEVEL: "2"    # GPUDirect RDMA level (2 = standard, 5 = full)
+      WANDB_PROJECT: "llama3-function-calling"    # Weights & Biases project name
+      WANDB_RUN_NAME: "ray-h100-16x-lora"    # Run name for tracking in Wandb
+      WANDB_API_KEY: "${WANDB_API_KEY}"    # Replaced by envsubst before kubectl apply
+    pip:  # Install packages on all Ray workers before job starts
+
+      - torch==2.5.1    # PyTorch with CUDA 12.1 support
+      - transformers==4.46.3    # Hugging Face Transformers (model loading)
+      - peft==0.13.2    # Parameter-Efficient Fine-Tuning (LoRA)
+      - accelerate==1.1.1    # Distributed training helpers
+      - trl==0.11.4    # Transformer Reinforcement Learning (SFTTrainer)
+      - datasets    # Hugging Face Datasets library
+      - bitsandbytes    # Quantization and AdamW optimizer
+      - wandb    # Weights & Biases for experiment tracking
   
-  # Use existing Ray cluster
+  # Use existing Ray cluster (created by Terraform)
+  # Don't create new cluster - connect to ray-cluster deployed in namespace
+
   clusterSelector:
     ray.io/cluster: ray-cluster
 
@@ -87,19 +95,23 @@ data:
     from datasets import load_dataset
     import wandb
     
-    # Configuration
-    MODEL_NAME = "meta-llama/Meta-Llama-3-8B-Instruct"
-    OUTPUT_DIR = "/mnt/data/checkpoints/llama3-function-calling-ray"
-    TRAIN_DATA = "/mnt/data/datasets/train.jsonl"
-    VAL_DATA = "/mnt/data/datasets/val.jsonl"
+    # Configuration - paths and model settings
+
+    MODEL_NAME = "meta-llama/Meta-Llama-3-8B-Instruct"    # Base model (8B parameters)
+    OUTPUT_DIR = "/mnt/data/checkpoints/llama3-function-calling-ray"    # Checkpoint save location (NFS)
+    TRAIN_DATA = "/mnt/data/datasets/train.jsonl"    # Training data (prepared by data-prep-job)
+    VAL_DATA = "/mnt/data/datasets/val.jsonl"    # Validation data for eval_steps
     
+    # LoRA (Low-Rank Adaptation) configuration
+    # Only trains ~0.5% of parameters (100M instead of 8B) for efficiency
+
     LORA_CONFIG = LoraConfig(
-        r=64,
-        lora_alpha=128,
-        lora_dropout=0.05,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        bias="none",
-        task_type="CAUSAL_LM",
+        r=64,                   # LoRA rank (higher = more capacity, more parameters)
+        lora_alpha=128,         # LoRA scaling factor (2x rank is typical)
+        lora_dropout=0.05,      # Dropout for LoRA layers (regularization)
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],    # Which layers to adapt
+        bias="none",            # Don't train bias terms
+        task_type="CAUSAL_LM",  # Causal language modeling (autoregressive generation)
     )
     
     def format_function_calling(example):
@@ -140,15 +152,23 @@ data:
         return {"text": text}
     
     def train_func():
-        """Training function executed on each worker."""
+        """Training function executed on each worker.
+        
+        Ray spawns 16 copies of this function (one per GPU):
+        - rank 0-7: Node 0, GPUs 0-7
+        - rank 8-15: Node 1, GPUs 0-7
+        """
         # Get distributed training context from Ray
-        world_size = train.get_context().get_world_size()
-        rank = train.get_context().get_world_rank()
-        local_rank = train.get_context().get_local_rank()
+
+        world_size = train.get_context().get_world_size()    # Total workers = 16
+        rank = train.get_context().get_world_rank()    # Worker ID: 0-15
+        local_rank = train.get_context().get_local_rank()    # GPU ID within node: 0-7
         
         print(f"Worker {rank}/{world_size} starting (local_rank={local_rank})")
 
-        # Initialize wandb on rank 0 only
+        # Initialize wandb on rank 0 only (avoid duplicate logging from all 16 workers)
+        # Only the master worker (rank 0) uploads metrics to Wandb
+
         if rank == 0 and os.environ.get("WANDB_API_KEY"):
             wandb.init(
                 project=os.environ.get("WANDB_PROJECT", "llama3-function-calling"),
@@ -157,186 +177,222 @@ data:
                     "model": MODEL_NAME,
                     "lora_r": 64,
                     "lora_alpha": 128,
-                    "world_size": world_size,
+                    "world_size": world_size,    # Log how many GPUs used
                 }
             )
 
-        # Load tokenizer
+        # Load tokenizer (same on all workers)
+
         tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = "right"
+        tokenizer.pad_token = tokenizer.eos_token    # Use EOS as padding token
+        tokenizer.padding_side = "right"    # Pad sequences on the right side
         
-        # Load model
+        # Load model (each worker loads full model into its GPU)
+
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME,
-            torch_dtype=torch.bfloat16,
-            use_cache=False,  # Required for gradient checkpointing
+            torch_dtype=torch.bfloat16,    # Use BF16 for H100 efficiency (2x faster than FP32)
+            use_cache=False,    # Required for gradient checkpointing (saves memory)
         )
         
-        # Apply LoRA
+        # Apply LoRA adapters (wraps base model with low-rank matrices)
+        # Only LoRA parameters will be trained, base model stays frozen
+
         model = get_peft_model(model, LORA_CONFIG)
-        model.enable_input_require_grads()
+        model.enable_input_require_grads()    # Required for gradient checkpointing
         
+        # Print trainable parameters count (only on rank 0 to avoid spam)
+
         if rank == 0:
-            model.print_trainable_parameters()
+            model.print_trainable_parameters()    # Shows ~0.5% parameters trainable
         
         # Load datasets - use local cache to avoid cross-worker cache conflicts
-        # Each worker caches independently in /tmp (local to each node)
+        # Problem: Multiple workers reading/writing same cache on NFS causes file locks
+        # Solution: Each worker caches independently in /tmp (local disk, not shared)
+
         import tempfile
-        local_cache_dir = tempfile.mkdtemp(prefix="hf_cache_")
+        local_cache_dir = tempfile.mkdtemp(prefix="hf_cache_")    # Creates /tmp/hf_cache_XXXXX
         
+        # Load training data from NFS (prepared by data-prep-job)
+
         train_data = load_dataset(
-            "json", 
-            data_files=TRAIN_DATA, 
+            "json",    # Format: JSON Lines (one JSON object per line)
+            data_files=TRAIN_DATA,    # Path to train.jsonl on NFS
             split="train",
-            cache_dir=local_cache_dir,
+            cache_dir=local_cache_dir,    # Cache in /tmp to avoid NFS conflicts
         )
+        # Load validation data
+
         val_data = load_dataset(
             "json", 
-            data_files=VAL_DATA, 
+            data_files=VAL_DATA,    # Path to val.jsonl on NFS
             split="train",
             cache_dir=local_cache_dir,
         )
         
         # Map with load_from_cache_file=False to avoid cache conflicts across nodes
-        # Each worker processes the data independently but identically
+        # Each worker processes the data independently but identically (deterministic)
+        # Format: {"messages": [...]} → {"text": "<|begin_of_text|>..."}
+
         train_data = train_data.map(format_function_calling, load_from_cache_file=False)
         val_data = val_data.map(format_function_calling, load_from_cache_file=False)
         
         # Pre-tokenize the data to avoid SFTTrainer's internal tokenization which causes cache conflicts
+        # Tokenization: text strings → token IDs (numbers that model understands)
+
         def tokenize_function(examples):
             return tokenizer(
                 examples["text"],
-                truncation=True,
-                max_length=2048,
-                padding=False,
+                truncation=True,    # Cut sequences longer than max_length
+                max_length=2048,    # Max sequence length (Llama-3 supports up to 8192)
+                padding=False,      # Don't pad yet (handled by data collator during training)
             )
         
+        # Tokenize all data (batched for speed, remove original text column)
+
         train_data = train_data.map(tokenize_function, batched=True, load_from_cache_file=False, remove_columns=["text"])
         val_data = val_data.map(tokenize_function, batched=True, load_from_cache_file=False, remove_columns=["text"])
         
-        # Training arguments with DDP
+        # Training arguments with DDP (DistributedDataParallel)
+        # DDP: Each GPU has full model copy, processes different data, syncs gradients
+
         training_args = TrainingArguments(
-            output_dir=OUTPUT_DIR,
-            num_train_epochs=3,
-            per_device_train_batch_size=4,
-            per_device_eval_batch_size=4,
-            gradient_accumulation_steps=4,
-            learning_rate=1.5e-4,
-            lr_scheduler_type="cosine",
-            warmup_ratio=0.03,
-            weight_decay=0.01,
-            logging_steps=10,
-            save_steps=200,
-            eval_strategy="steps",
-            eval_steps=200,
-            save_total_limit=3,
-            bf16=True,
-            gradient_checkpointing=True,
-            gradient_checkpointing_kwargs={"use_reentrant": False},
-            dataloader_num_workers=4,
-            ddp_find_unused_parameters=False,
-            report_to="wandb" if os.environ.get("WANDB_API_KEY") else "none",
+            output_dir=OUTPUT_DIR,                                              # Where to save checkpoints (NFS shared across nodes)
+            num_train_epochs=3,                                                 # Number of passes through full dataset
+            per_device_train_batch_size=4,                                      # Batch size per GPU (4 x 16 GPUs = 64 total)
+            per_device_eval_batch_size=4,                                       # Batch size for validation
+            gradient_accumulation_steps=4,                                      # Accumulate 4 batches before optimizer step (effective batch = 4x4x16 = 256)
+            learning_rate=1.5e-4,                                               # Higher LR for LoRA (base model frozen)
+            lr_scheduler_type="cosine",                                         # Cosine annealing (smooth LR decay)
+            warmup_ratio=0.03,                                                  # Warmup for first 3% of steps (stabilizes training)
+            weight_decay=0.01,                                                  # L2 regularization (prevents overfitting)
+            logging_steps=10,                                                   # Log metrics every 10 steps
+            save_steps=200,                                                     # Save checkpoint every 200 steps
+            eval_strategy="steps",                                              # Run evaluation periodically (not per epoch)
+            eval_steps=200,                                                     # Evaluate every 200 steps | "no"| "epoch"
+            save_total_limit=3,                                                 # Keep only last 3 checkpoints (saves disk space)
+            bf16=True,                                                          # Use BFloat16 precision (faster on H100, same accuracy as FP32)
+            gradient_checkpointing=True,                                        # Trade compute for memory (enables larger batch sizes)
+            gradient_checkpointing_kwargs={"use_reentrant": False},             # Use non-reentrant checkpointing (more stable)
+            dataloader_num_workers=4,                                           # Parallel data loading workers per GPU
+            ddp_find_unused_parameters=False,                                   # Optimization: skip unused parameter check (all params used)
+            report_to="wandb" if os.environ.get("WANDB_API_KEY") else "none",   # Log to Wandb if API key provided
         )
         
-        # Create trainer
+        # Create SFTTrainer (Supervised Fine-Tuning Trainer from TRL library)
+        # Wraps HuggingFace Trainer with optimizations for instruction tuning
         # Data is pre-tokenized, so skip SFTTrainer's internal preparation
         # This avoids cache conflicts when multiple workers process data simultaneously
+
         trainer = SFTTrainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_data,
-            eval_dataset=val_data,
-            tokenizer=tokenizer,
-            max_seq_length=2048,
-            packing=False,
-            dataset_kwargs={"skip_prepare_dataset": True},
+            model=model,                    # LoRA-wrapped model
+            args=training_args,             # Training configuration above
+            train_dataset=train_data,       # Pre-tokenized training data
+            eval_dataset=val_data,           # Pre-tokenized validation data
+            tokenizer=tokenizer,             # For data collation (padding batches)
+            max_seq_length=2048,             # Max sequence length (already enforced in tokenization)
+            packing=False,                  # Don't pack multiple samples into one sequence (simpler, more stable)
+            dataset_kwargs={"skip_prepare_dataset": True},    # Data already prepared, skip preprocessing
         )
         
-        # Check for existing checkpoints to resume from
+        # Check for existing checkpoints to resume from (handles restarts/failures)
+        # Checkpoints saved to NFS every 200 steps, all workers can read them
+
         import glob
-        checkpoints = glob.glob(f"{OUTPUT_DIR}/checkpoint-*")
+        checkpoints = glob.glob(f"{OUTPUT_DIR}/checkpoint-*")    # Find checkpoint-200, checkpoint-400, etc.
         resume_checkpoint = None
         if checkpoints:
-            # Find the latest checkpoint
-            latest = max(checkpoints, key=lambda x: int(x.split("-")[-1]))
+            # Find the latest checkpoint (highest number)
+            latest = max(checkpoints, key=lambda x: int(x.split("-")[-1]))    # Extract number from "checkpoint-600"
             resume_checkpoint = latest
             if rank == 0:
                 print(f"Resuming from checkpoint: {resume_checkpoint}")
         
-        # Train (with resume if checkpoint exists)
+        # Train! (with resume if checkpoint exists)
+        # DDP automatically syncs gradients across all 16 GPUs via NCCL
+
         trainer.train(resume_from_checkpoint=resume_checkpoint)
         
-        # Save final model (only on rank 0)
+        # Save final model (only on rank 0 - all ranks have identical weights due to DDP)
+        # Only master worker saves to avoid 16 workers writing to same location
+
         if rank == 0:
-            trainer.save_model(f"{OUTPUT_DIR}/final")
+            trainer.save_model(f"{OUTPUT_DIR}/final")                        # Saves LoRA adapters + tokenizer to NFS
             print(f"Model saved to {OUTPUT_DIR}/final")
             if os.environ.get("WANDB_API_KEY"):
-                wandb.finish()
+                wandb.finish()                                               # Upload final metrics and close Wandb run
 
-        return {"status": "completed", "rank": rank}
+        return {"status": "completed", "rank": rank}    # Return status to Ray
     
     if __name__ == "__main__":
-        # Initialize Ray (connects to existing cluster)
+        # Initialize Ray (connects to existing cluster deployed by Terraform)
+        # Auto-discovers Ray head at ray-cluster-head-svc:10001
+
         ray.init()
         
         print(f"Ray cluster resources: {ray.cluster_resources()}")
         
         # Configure distributed training - 16 workers with 1 GPU each
-        # Uses DDP for data parallelism across all GPUs
+        # Ray spawns 16 copies of train_func() across the cluster
+        # Uses DDP (DistributedDataParallel) for data parallelism across all GPUs
+
         trainer = TorchTrainer(
-            train_func,
+            train_func,                                         # Function to run on each worker (defined above)
             scaling_config=ScalingConfig(
-                num_workers=16,          # 16 total GPUs
-                use_gpu=True,
-                resources_per_worker={"GPU": 1, "CPU": 8},
+                num_workers=16,                                 # 16 total workers (2 nodes x 8 GPUs per node)
+                use_gpu=True,                                   # Each worker needs 1 GPU
+                resources_per_worker={"GPU": 1, "CPU": 8},      # Resource request per worker
             ),
             run_config=RunConfig(
-                name="llama3-finetuning",
-                storage_path="/mnt/data/ray_results",
+                name="llama3-finetuning",                       # Job name (visible in Ray Dashboard)
+                storage_path="/mnt/data/ray_results",           # Ray results storage (NFS)
                 checkpoint_config=CheckpointConfig(
-                    num_to_keep=3,
+                    num_to_keep=3,                              # Keep last 3 Ray checkpoints (separate from trainer checkpoints)
                 ),
             ),
         )
         
-        # Run training
+        # Run training! Blocks until all workers complete
+        # Ray handles worker scheduling, fault tolerance, and result collection
+
         result = trainer.fit()
         print(f"Training completed: {result}")
 
 ---
-# Job to copy script to shared storage
+# Job to copy script to shared storage (NFS)
+# Why needed: RayJob entrypoint expects script at /mnt/data/ray-train.py
+# This copies from ConfigMap → NFS so all Ray workers can access it
 apiVersion: batch/v1
 kind: Job
 metadata:
   name: copy-ray-script
   namespace: ray-cluster
 spec:
-  ttlSecondsAfterFinished: 60
+  ttlSecondsAfterFinished: 60  # Auto-delete 60s after completion
   template:
     spec:
-      restartPolicy: Never
+      restartPolicy: Never    # Don't retry on failure
       containers:
       - name: copy
-        image: busybox
+        image: busybox    # Lightweight image with cp command
         command: ["/bin/sh", "-c"]
         args:
         - |
           echo "Copying Ray training script to shared storage..."
-          cp /scripts/ray-train.py /mnt/data/ray-train.py
-          chmod +x /mnt/data/ray-train.py
+          cp /scripts/ray-train.py /mnt/data/ray-train.py    # ConfigMap → NFS
+          chmod +x /mnt/data/ray-train.py    # Make executable
           echo "Done!"
-          ls -la /mnt/data/ray-train.py
+          ls -la /mnt/data/ray-train.py    # Verify
         volumeMounts:
-        - name: script
+        - name: script    # ConfigMap with ray-train.py embedded
           mountPath: /scripts
-        - name: shared-data
+        - name: shared-data    # Nebius Filestore (2TB NFS)
           mountPath: /mnt/data
       volumes:
-      - name: script
+      - name: script    # Mount ConfigMap as read-only files
         configMap:
-          name: ray-train-script
-      - name: shared-data
+          name: ray-train-script    # Defined at top of this file
+      - name: shared-data    # Mount NFS (hostPath because NFS pre-mounted to nodes)
         hostPath:
-          path: /mnt/data
+          path: /mnt/data    # NFS mounted here by Terraform
           type: Directory

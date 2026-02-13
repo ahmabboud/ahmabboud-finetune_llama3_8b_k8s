@@ -1,70 +1,70 @@
 apiVersion: v1
-kind: Service
+kind: Service  # Headless service for DNS-based pod discovery
 metadata:
   name: preflight-check
   namespace: ray-cluster
 spec:
-  clusterIP: None  # Headless service for pod discovery
-  publishNotReadyAddresses: true  # Show pods even before ready
+  clusterIP: None  # Headless service = direct pod IPs (no load balancing)
+  publishNotReadyAddresses: true  # Show pods even before ready (for peer discovery)
   selector:
     app: preflight-check
   ports:
-    - port: 29500
+    - port: 29500  # NCCL coordination port
       name: nccl
 ---
 apiVersion: batch/v1
-kind: Job
+kind: Job  # Kubernetes Job for pre-flight validation checks
 metadata:
   name: preflight-check
   namespace: ray-cluster
 spec:
-  ttlSecondsAfterFinished: 300
-  backoffLimit: 0
-  parallelism: 2
-  completions: 2
+  ttlSecondsAfterFinished: 300  # Auto-delete after 5 minutes
+  backoffLimit: 0  # Don't retry on failure (fail fast)
+  parallelism: 2  # Run 2 pods simultaneously (one per node)
+  completions: 2  # Need both pods to succeed
   completionMode: Indexed  # Each pod gets JOB_COMPLETION_INDEX (0 or 1)
   template:
     metadata:
       labels:
         app: preflight-check
     spec:
-      restartPolicy: Never
-      subdomain: preflight-check  # For DNS: preflight-check-0.preflight-check.ray-cluster.svc
+      restartPolicy: Never  # Don't restart on failure (fail fast for debugging)
+      subdomain: preflight-check  # Enables DNS: <pod-name>.<subdomain>.<namespace>.svc
       affinity:
-        podAntiAffinity:
+        podAntiAffinity:  # Force pods onto different nodes (one pod per node)
           requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
                 matchLabels:
                   app: preflight-check
-              topologyKey: "kubernetes.io/hostname"
-      tolerations:
+              topologyKey: "kubernetes.io/hostname"  # hostname = node
+      tolerations:  # Allow scheduling on GPU nodes (which have NoSchedule taint)
         - key: "nvidia.com/gpu"
           operator: "Exists"
           effect: "NoSchedule"
       containers:
         - name: preflight
-          image: rayproject/ray:2.46.0-py310-gpu
+          image: rayproject/ray:2.46.0-py310-gpu  # Ray image with CUDA support
           resources:
             limits:
-              nvidia.com/gpu: 8
+              nvidia.com/gpu: 8  # Request all 8 H100 GPUs per pod
             requests:
               nvidia.com/gpu: 8
-              memory: "128Gi"
-              cpu: "32"
+              memory: "128Gi"  # ~16GB per GPU
+              cpu: "32"  # ~4 CPUs per GPU
           env:
-            - name: NCCL_DEBUG
+            - name: NCCL_DEBUG  # Enable NCCL logging to see network transport (IB vs TCP)
               value: "INFO"
-            - name: NCCL_DEBUG_SUBSYS
+            - name: NCCL_DEBUG_SUBSYS  # Log initialization and network details
               value: "INIT,NET"
-            - name: NCCL_IB_DISABLE
+            - name: NCCL_IB_DISABLE  # 0 = Enable InfiniBand (1 would force TCP)
               value: "0"
-            - name: NCCL_NET_GDR_LEVEL
+            - name: NCCL_NET_GDR_LEVEL  # 5 = Full GPUDirect RDMA (GPU->GPU without CPU)
               value: "5"
-            - name: WORLD_SIZE
+            - name: WORLD_SIZE  # Total number of nodes in distributed training
               value: "2"
-            - name: MASTER_PORT
+            - name: MASTER_PORT  # Port for inter-node coordination
               value: "29500"
-            - name: POD_NAME
+            - name: POD_NAME  # Inject pod metadata for logging
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
@@ -73,23 +73,23 @@ spec:
                 fieldRef:
                   fieldPath: status.podIP
           volumeMounts:
-            - name: shared-data
+            - name: shared-data  # Nebius Filestore (2TB NFS)
               mountPath: /mnt/data
-            - name: shm
+            - name: shm  # Shared memory for PyTorch DataLoader workers
               mountPath: /dev/shm
-            - name: nccl-test-script
+            - name: nccl-test-script  # ConfigMap with NCCL test script
               mountPath: /scripts/nccl_test.py
               subPath: nccl_test.py
-            - name: smoke-test-script
+            - name: smoke-test-script  # ConfigMap with training pipeline smoke test
               mountPath: /scripts/smoke_test.py
               subPath: smoke_test.py
           command:
             - /bin/bash
             - -c
             - |
-              set -e
+              set -e  # Exit on any error
               
-              # Get rank from indexed job
+              # Get rank from indexed job (0 or 1 for 2-node setup)
               RANK=${JOB_COMPLETION_INDEX:-0}
               
               echo "=================================================="
@@ -97,15 +97,16 @@ spec:
               echo " Pod: $POD_NAME | Rank: $RANK | IP: $POD_IP"
               echo "=================================================="
               
-              GREEN='\033[92m'
+              GREEN='\033[92m'  # ANSI color codes for terminal output
               RED='\033[91m'
               YELLOW='\033[93m'
               RESET='\033[0m'
               
+              # Reusable check function: check "Test name" "true/false" "Optional details"
               check() {
-                local name="$1"
-                local passed="$2"
-                local details="$3"
+                local name="$1"      # First argument: test name
+                local passed="$2"    # Second argument: "true" or "false"
+                local details="$3"   # Third argument: optional details message
                 if [ "$passed" = "true" ]; then
                   echo -e "  ${GREEN}✓ PASS${RESET}  $name"
                 else
@@ -168,39 +169,68 @@ spec:
               # ============================================
               # 4. CUDA & PyTorch
               # ============================================
+              # Tests: PyTorch installation, CUDA availability, GPU visibility, tensor operations
+              # Note: Python code embedded in bash (requires quote escaping for nested strings)
               echo ""
               echo "=================================================="
               echo " 4. CUDA & PyTorch"
               echo "=================================================="
               
               python3 -c "
-              import torch
+              import sys
+              try:
+                  import torch
+              except ImportError as e:
+                  print(f'  \033[91m✗ FAIL\033[0m  PyTorch installed')
+                  print(f'         {str(e)[:100]}')
+                  sys.exit(1)
+              
               GREEN, RED, RESET = '\033[92m', '\033[91m', '\033[0m'
               def check(name, passed, details=''):
                   print(f'  {GREEN if passed else RED}{\"✓ PASS\" if passed else \"✗ FAIL\"}{RESET}  {name}')
                   if details: print(f'         {details}')
+                  return passed
               
+              # PyTorch version check (import succeeded if we're here)
               check('PyTorch installed', True, f'Version {torch.__version__}')
-              check('CUDA available', torch.cuda.is_available())
-              check('CUDA version', True, torch.version.cuda)
               
+              # CUDA availability
+              if not check('CUDA available', torch.cuda.is_available()):
+                  sys.exit(1)
+              
+              # CUDA version validation
+              cuda_version = torch.version.cuda
+              check('CUDA version', cuda_version is not None, str(cuda_version))
+              
+              # GPU count check
               gpu_count = torch.cuda.device_count()
-              check(f'PyTorch sees {gpu_count} GPUs', gpu_count == 8)
+              if not check(f'PyTorch sees {gpu_count} GPUs', gpu_count == 8):
+                  sys.exit(1)
               
-              # Quick tensor test
-              for i in range(gpu_count):
-                  x = torch.randn(1000, 1000, device=f'cuda:{i}')
-                  y = torch.matmul(x, x)
-              check('CUDA tensor ops on all GPUs', True)
+              # Tensor operations with exception handling
+              try:
+                  for i in range(gpu_count):
+                      x = torch.randn(1000, 1000, device=f'cuda:{i}')
+                      y = torch.matmul(x, x)
+                      # Validate result shape
+                      assert y.shape == (1000, 1000), f'Wrong shape on GPU {i}: {y.shape}'
+                      # Validate result is not NaN/Inf
+                      assert not torch.isnan(y).any(), f'NaN detected on GPU {i}'
+                      assert not torch.isinf(y).any(), f'Inf detected on GPU {i}'
+                  check('CUDA tensor ops on all GPUs', True)
+              except Exception as e:
+                  check('CUDA tensor ops on all GPUs', False, str(e)[:100])
+                  sys.exit(1)
               "
               
               # ============================================
               # 5. INTRA-NODE NVLink
               # ============================================
+              # Tests: GPU-to-GPU communication within same node (900 GB/s NVLink)
               echo ""
               echo "=================================================="
               echo " 5. INTRA-NODE NVLink P2P"
-              echo "=================================================="
+              echo "================================================="=
               
               python3 -c "
               import torch
@@ -224,6 +254,8 @@ spec:
               # ============================================
               # 6. INTER-NODE NCCL (The real test)
               # ============================================
+              # Tests: Node-to-node communication via InfiniBand (400 Gb/s)
+              # This is the critical test - validates distributed training will work
               echo ""
               echo "=================================================="
               echo " 6. INTER-NODE NCCL COMMUNICATION"
@@ -232,8 +264,8 @@ spec:
               echo "  World Size: $WORLD_SIZE"
               echo "  My IP: $POD_IP"
               
-              # Wait for all pods to be registered with the headless service
-              # Then use the smallest IP as master (deterministic across all pods)
+              # Peer discovery via headless service DNS
+              # Wait for all pods to be registered, then use smallest IP as master (deterministic)
               SERVICE_DNS="preflight-check.ray-cluster.svc.cluster.local"
               
               echo "  Discovering peers via headless service DNS..."
@@ -262,7 +294,7 @@ spec:
                 exit 1
               fi
               
-              # Determine our actual rank based on IP ordering
+              # Determine our actual rank based on IP ordering (more reliable than JOB_COMPLETION_INDEX)
               SORTED_IPS=$(echo "$ALL_IPS" | tr ' ' '\n' | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n)
               ACTUAL_RANK=0
               for ip in $SORTED_IPS; do
@@ -277,7 +309,7 @@ spec:
               # Use computed rank (more reliable than JOB_COMPLETION_INDEX across nodes)
               export RANK=$ACTUAL_RANK
               
-              # Simple time-based barrier (nc not available in this image)
+              # Simple time-based barrier (nc not available in rayproject/ray image)
               echo "  Waiting 10s for all ranks to be ready..."
               sleep 10
               
@@ -295,10 +327,11 @@ spec:
               # ============================================
               # 7. STORAGE
               # ============================================
+              # Tests: NFS mount, disk space, checkpoint directory
               echo ""
               echo "=================================================="
               echo " 7. STORAGE"
-              echo "=================================================="
+              echo "================================================="=
               
               if [ -d "/mnt/data" ]; then
                 check "Storage mounted at /mnt/data" "true"
@@ -321,10 +354,11 @@ spec:
               # ============================================
               # 8. RAY CLUSTER
               # ============================================
+              # Tests: Ray cluster connectivity, resource visibility
               echo ""
               echo "=================================================="
               echo " 8. RAY CLUSTER CONNECTION"
-              echo "=================================================="
+              echo "================================================="=
               
               python3 -c "
               import ray
@@ -347,8 +381,9 @@ spec:
               
               # ============================================
               # 9. TRAINING PIPELINE SMOKE TEST
-              # Only run on rank 0 to avoid duplicate work
               # ============================================
+              # Tests: TRL/PEFT/LoRA imports, SFTTrainer, single training step
+              # Only run on rank 0 to avoid duplicate work
               if [ "$RANK" = "0" ]; then
                 echo ""
                 echo "=================================================="
@@ -356,8 +391,9 @@ spec:
                 echo "=================================================="
                 
                 # Unset distributed env vars to force single-GPU mode for smoke test
+                # This prevents PyTorch from trying to initialize distributed training
                 unset WORLD_SIZE LOCAL_RANK RANK MASTER_ADDR MASTER_PORT
-                export CUDA_VISIBLE_DEVICES=0
+                export CUDA_VISIBLE_DEVICES=0  # Use only first GPU
                 
                 # Run the smoke test
                 python3 /scripts/smoke_test.py
@@ -380,18 +416,18 @@ spec:
               echo "  Rank: $RANK"
               echo "  All checks finished."
       volumes:
-        - name: shared-data
+        - name: shared-data  # Nebius Filestore mounted to K8s nodes
           hostPath:
             path: /mnt/data
             type: Directory
-        - name: shm
+        - name: shm  # Shared memory for PyTorch multiprocessing
           emptyDir:
             medium: Memory
             sizeLimit: "64Gi"
-        - name: nccl-test-script
+        - name: nccl-test-script  # Embedded Python script for NCCL testing
           configMap:
             name: nccl-test-script
-        - name: smoke-test-script
+        - name: smoke-test-script  # Embedded Python script for training pipeline test
           configMap:
             name: smoke-test-script
 ---
